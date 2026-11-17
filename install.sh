@@ -620,9 +620,15 @@ show_links() {   # show_links [协议]  不带参数 = 全部
   gen_clients
   echo
   blue "---------- 导入客户端 ----------"
-  echo "小火箭 Shadowrocket：扫上面的二维码，或复制链接后打开小火箭自动识别"
-  echo "Clash（Verge / Meta / mihomo）：配置文件已生成 $CLASH"
-  if sub_on; then sub_urls; else echo "想用「订阅链接」一键导入：主菜单 3 开启订阅"; fi
+  echo "小火箭 Shadowrocket：扫上面每个节点的二维码，或复制链接后打开小火箭自动识别"
+  if sub_on; then
+    import_info
+  elif [[ $NONINT != 1 && -f $CLASH ]]; then
+    local a; read -r -p "Clash 只能通过「订阅链接」导入，现在开启订阅并显示 Clash 二维码？[Y/n]: " a
+    if [[ $a != [nN] ]]; then sub_enable; else echo "以后可在主菜单 3 开启订阅"; fi
+  else
+    echo "Clash（Verge / Meta）导入：运行 onekey sub 开启订阅，获取订阅链接和二维码"
+  fi
   echo
 }
 
@@ -718,6 +724,33 @@ sub_urls() {
       echo "  Clash 订阅：        http://$hb:$PORT/$TOKEN/clash.yaml"
     done )
 }
+sub_url() {   # sub_url sub|clash.yaml -> 按「IP 设置」第一个地址生成的订阅地址
+  ( . "$SUB_ENV"
+    local h; h=$(link_hosts | awk '{print $1}'); [[ $h == *:* ]] && h="[$h]"
+    echo "http://$h:$PORT/$TOKEN/$1" )
+}
+qr() { [[ $NONINT != 1 ]] && command -v qrencode >/dev/null 2>&1 && qrencode -t ANSIUTF8 "$1"; }
+import_info() {   # 显示 Clash / 小火箭 的订阅导入方式（链接 + 二维码）
+  sub_on || return
+  local cu su; cu=$(sub_url clash.yaml); su=$(sub_url sub)
+  echo
+  blue "【Clash Verge / Clash Meta / mihomo】"
+  echo "订阅地址：$cu"
+  echo "一键导入（在装了 Clash 的手机或电脑上打开这个链接）："
+  echo "  clash://install-config?url=$(uri "$cu")&name=$(uri "$NAME_PREFIX")"
+  echo "手机扫码导入 / 复制订阅地址："
+  qr "$cu"
+  echo
+  blue "【小火箭 Shadowrocket 订阅】"
+  echo "订阅地址：$su"
+  echo "小火箭首页右上角扫码，或 ＋ → 类型 Subscribe → 粘贴订阅地址："
+  qr "sub://$(printf '%s' "$su" | base64 | tr -d '\n')#$(uri "$NAME_PREFIX")"
+  if [[ $LINK_IP == both && -n $IP4 && -n $IP6 ]]; then
+    echo
+    echo "（另一个 IP 的订阅地址）"; sub_urls | grep -v "$(sub_url sub | cut -d/ -f3)"
+  fi
+  yellow "订阅地址等于全部节点的密码，不要公开；泄露后在主菜单 3 更换订阅地址"
+}
 
 httpd_cmd() {   # 找到可用的 busybox httpd（Debian 在 busybox 里，Alpine 在 busybox-extras 里）
   if command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx httpd; then echo "$(command -v busybox) httpd"
@@ -741,15 +774,13 @@ sub_enable() {
   gen_clients
   svc restart onekey-sub; sleep 1
   [[ $(svc status onekey-sub) == active ]] || { red "订阅服务启动失败"; return 1; }
-  green "订阅已开启（地址里带随机密钥，不要公开）："
-  sub_urls
-  echo "小火箭：右上角 ＋ → 类型选 Subscribe → 粘贴「小火箭订阅」地址"
-  echo "Clash Verge：订阅 → 粘贴「Clash 订阅」地址 → 导入"
+  green "订阅已开启（地址里带随机密钥）"
+  import_info
 }
 sub_reset() {
   sub_on || { yellow "订阅未开启"; return; }
   ( . "$SUB_ENV"; rm -rf "$WWW/$TOKEN"; printf "PORT='%s'\nTOKEN='%s'\n" "$PORT" "$(rand_hex 16)" >"$SUB_ENV" )
-  gen_clients; green "已更换订阅地址，旧地址立即失效："; sub_urls
+  gen_clients; green "已更换订阅地址，旧地址立即失效，请在客户端重新导入："; import_info
 }
 sub_disable() {
   sub_on || { yellow "订阅未开启"; return; }
@@ -758,7 +789,7 @@ sub_disable() {
 sub_menu() {
   echo
   echo "订阅链接（小火箭 / Clash 一键导入）："
-  echo "  1) 开启 / 查看订阅地址"
+  echo "  1) 开启 / 查看订阅地址和二维码"
   echo "  2) 更换订阅地址（旧地址失效）"
   echo "  3) 关闭订阅"
   echo "  4) 显示 Clash 配置内容"

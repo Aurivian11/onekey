@@ -37,8 +37,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/Aurivian11/onekey/main/install
 装好后，以后在服务器上输入 `onekey` 就能打开菜单。
 
 1. 选 **1 安装 / 添加协议**，选协议，端口直接回车（随机）。
-2. 安装完自动显示链接和二维码，用手机扫码或复制链接导入客户端。
-3. 想用订阅：选 **3 订阅链接**，把地址粘贴到小火箭或 Clash。
+2. 安装完自动显示每个节点的链接和二维码，小火箭直接扫码导入。
+3. Clash 用户：查看链接时按回车开启订阅，会显示 Clash 订阅地址、`clash://` 一键导入链接和二维码（菜单 3 也能随时查看）。
 
 ## 支持的协议
 
@@ -58,8 +58,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/Aurivian11/onekey/main/install
 
 | 客户端 | 导入方式 | 可用节点 |
 |---|---|---|
-| 小火箭 Shadowrocket | 扫二维码 / 复制链接自动识别 / 订阅：＋ → Subscribe → 粘贴「小火箭订阅」地址 | 除 Snell 外 |
-| Clash Verge Rev / Clash Meta for Android / Stash | 粘贴「Clash 订阅」地址，或导入 `/etc/onekey/clash.yaml` | 除 Snell 外 |
+| 小火箭 Shadowrocket | 扫每个节点的二维码 / 复制链接自动识别 / 扫「小火箭订阅」二维码一次导入全部 | 除 Snell 外 |
+| Clash Verge Rev / Clash Meta for Android / Stash | 打开 `clash://install-config?url=…` 一键导入链接 / 扫 Clash 订阅二维码 / 粘贴「Clash 订阅」地址 | 除 Snell 外 |
 | v2rayN / NekoBox / sing-box App | 复制链接或「小火箭订阅」地址 | 除 Snell 外 |
 | Surge | 把菜单 2 里的 Snell 行粘贴到 `[Proxy]` | Snell v6 |
 
