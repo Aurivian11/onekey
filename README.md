@@ -4,7 +4,8 @@
 
 - **7 种协议**：VLESS-REALITY、Hysteria2、TUIC、AnyTLS、VLESS-Argo、Shadowsocks、Snell v6
 - **双内核按需安装**：Xray 支持的协议用 Xray，不支持的用 sing-box；选了协议才下载内核，不用了自动删除
-- **随机端口**（10000–60000），IPv4 / IPv6 双栈，自动避开已占用端口
+- **随机端口**（10000–60000），自动避开已占用端口
+- **IPv4 / IPv6 可选**：节点链接用 IPv4 + IPv6 / 只用 IPv4 / 只用 IPv6；出站可选优先或只用 IPv4 / IPv6
 - **一键导入**：分享链接 + 二维码、Clash（mihomo）配置、带随机密钥的订阅链接
 - **TCP 调优**：BBR + fq + 按内存自动调整缓冲区，可一键恢复
 - **干净卸载**：程序、配置、服务、内核参数全部还原
@@ -14,13 +15,14 @@
   1) 安装 / 添加协议
   2) 查看节点链接
   3) 订阅链接（小火箭 / Clash）
-  4) 删除某个协议
-  5) 重启所有服务
-  6) 运行状态
-  7) 开启 BBR 加速
-  8) TCP 调优
-  9) 更新内核（已安装的 Xray / sing-box）
- 10) 卸载全部
+  4) IP 设置（IPv4 / IPv6）
+  5) 删除某个协议
+  6) 重启所有服务
+  7) 运行状态
+  8) 开启 BBR 加速
+  9) TCP 调优
+ 10) 更新内核（已安装的 Xray / sing-box）
+ 11) 卸载全部
   0) 退出
 ```
 
@@ -67,9 +69,21 @@ bash <(curl -Ls https://raw.githubusercontent.com/Aurivian11/onekey/main/install
 
 > **REALITY 兼容性（2026-11 实测）**：Xray 从 v26.7.11 起，REALITY 服务端与 sing-box 内核、mihomo（Clash Meta）内核的客户端不兼容，Xray 内核客户端（如 v2rayN）可正常连接；其它协议不受影响。
 
+## IP 设置（IPv4 / IPv6）
+
+菜单 **4**，两项可分别设置：
+
+| 设置 | 选项 | 作用 |
+|---|---|---|
+| 节点地址 | IPv4 + IPv6 / 只用 IPv4 / 只用 IPv6 | 决定链接、二维码、Clash 配置、订阅里用哪个 IP。第一次安装协议时会询问（服务器同时有 IPv4 和 IPv6 时） |
+| 出站 | 系统默认 / 优先 IPv4 / 优先 IPv6 / 只用 IPv4 / 只用 IPv6 | 通过节点访问网站时，对方看到的是服务器的 IPv4 还是 IPv6（Xray、sing-box、Snell 同时生效） |
+
+- 修改「节点地址」后链接会变，客户端需要重新导入或更新订阅；修改「出站」不影响链接。
+- VLESS-Argo 始终使用 Cloudflare 隧道域名，不受「节点地址」影响。
+
 ## TCP 调优
 
-菜单 **8** 可选：应用推荐调优 / 查看当前参数 / 恢复调优前的参数。
+菜单 **9** 可选：应用推荐调优 / 查看当前参数 / 恢复调优前的参数。
 
 - BBR 拥塞控制 + fq 队列
 - 收发缓冲区按内存自动调整：≤512M → 8MB，1G → 16MB，2–4G → 32MB，更大 → 64MB（同时满足 Hysteria2 / TUIC 对 UDP 缓冲区的要求）
@@ -84,6 +98,7 @@ onekey add reality          # 非交互安装：reality | hy2 | tuic | anytls | 
 PORT_SET=443 onekey add reality
 METHOD=chacha20-ietf-poly1305 onekey add ss
 SNI=www.microsoft.com onekey add reality
+IP_MODE=6 onekey add hy2        # 第一次安装时直接指定只用 IPv6（4 | 6 | both）
 onekey links                # 查看全部链接
 onekey sub                  # 开启订阅 / 查看订阅地址（sub reset 换地址，sub off 关闭）
 onekey clash                # 输出 Clash 配置
@@ -92,6 +107,9 @@ onekey status               # 运行状态
 onekey tcp                  # TCP 调优（tcp show 查看，tcp restore 恢复）
 onekey bbr                  # 只开 BBR
 onekey rebuild              # 按当前规则重新生成内核配置
+onekey ip                   # 查看 IP 设置
+onekey ip 6                 # 节点链接只用 IPv6（4 只用 IPv4，both 两个都生成）
+onekey ip out prefer6       # 出站优先 IPv6（auto | prefer4 | prefer6 | only4 | only6）
 onekey uninstall            # 卸载全部
 ```
 
@@ -127,7 +145,7 @@ bash test_links.sh
 
 ## 常见问题
 
-- **连不上**：先确认服务商的防火墙 / 安全组放行了端口（Hysteria2、TUIC 是 UDP）；菜单 6 看服务是否在运行。
+- **连不上**：先确认服务商的防火墙 / 安全组放行了端口（Hysteria2、TUIC 是 UDP）；菜单 7 看服务是否在运行。
 - **Hysteria2 / TUIC / AnyTLS 报证书错误**：客户端打开「跳过证书验证 / allowInsecure」。
 - **Argo 链接失效**：临时隧道在服务器或服务重启后域名会变，菜单 2 重新查看；订阅会自动更新。
 - **想换伪装网站**：重新添加 REALITY 时在「伪装域名 (SNI)」填其它支持 TLS 1.3 的大站。

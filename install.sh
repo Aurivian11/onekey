@@ -86,6 +86,90 @@ get_ip() {
   [[ -n $IP4 || -n $IP6 ]] || die "获取公网 IP 失败"
 }
 
+# ---------------- IP 设置（IPv4 / IPv6） ----------------
+# LINK_IP：节点链接 / 二维码 / 订阅里用哪个地址   both | 4 | 6
+# OUT_IP ：出站（访问网站时用的 IP）            auto | prefer4 | prefer6 | only4 | only6
+IP_ENV=$BASE/ip.env
+LINK_IP=both; OUT_IP=auto
+[[ -f $IP_ENV ]] && . "$IP_ENV"
+save_ip() { printf "LINK_IP='%s'\nOUT_IP='%s'\n" "$LINK_IP" "$OUT_IP" >"$IP_ENV"; chmod 600 "$IP_ENV"; }
+link_hosts() {
+  [[ -z $IP4$IP6 ]] && get_ip
+  case $LINK_IP in
+    4) echo "${IP4:-$IP6}" ;;
+    6) echo "${IP6:-$IP4}" ;;
+    *) echo "$IP4 $IP6" ;;
+  esac
+}
+link_label() { case $LINK_IP in 4) echo "只用 IPv4";; 6) echo "只用 IPv6";; *) echo "IPv4 + IPv6";; esac; }
+out_label()  { case $OUT_IP in prefer4) echo "优先 IPv4";; prefer6) echo "优先 IPv6";; only4) echo "只用 IPv4";; only6) echo "只用 IPv6";; *) echo "系统默认";; esac; }
+xray_strategy() { case $OUT_IP in prefer4) echo UseIPv4v6;; prefer6) echo UseIPv6v4;; only4) echo UseIPv4;; only6) echo UseIPv6;; *) echo AsIs;; esac; }
+sb_strategy()   { case $OUT_IP in prefer4) echo prefer_ipv4;; prefer6) echo prefer_ipv6;; only4) echo ipv4_only;; only6) echo ipv6_only;; *) echo "";; esac; }
+snell_pref()    { case $OUT_IP in prefer4) echo prefer-ipv4;; prefer6) echo prefer-ipv6;; only4) echo ipv4-only;; only6) echo ipv6-only;; *) echo default;; esac; }
+
+first_ip_setup() {   # 第一次安装协议时选择节点地址（环境变量 IP_MODE=4|6|both 可跳过询问）
+  [[ -f $IP_ENV ]] && return
+  [[ -z $IP4$IP6 ]] && get_ip
+  if [[ -n ${IP_MODE:-} ]]; then LINK_IP=$IP_MODE
+  elif [[ -z $IP4 ]]; then LINK_IP=6
+  elif [[ -z $IP6 ]]; then LINK_IP=4
+  elif [[ $NONINT != 1 ]]; then
+    echo
+    echo "检测到 IPv4：$IP4    IPv6：$IP6"
+    echo "节点链接使用哪个地址？（以后可在主菜单「IP 设置」修改）"
+    echo "  1) IPv4 + IPv6 都生成"
+    echo "  2) 只用 IPv4"
+    echo "  3) 只用 IPv6"
+    case $(ask "请选择" 1) in 2) LINK_IP=4;; 3) LINK_IP=6;; *) LINK_IP=both;; esac
+  fi
+  save_ip
+}
+
+set_link_ip() {   # set_link_ip both|4|6
+  [[ -z $IP4$IP6 ]] && get_ip
+  [[ $1 == 6 && -z $IP6 ]] && { red "这台服务器没有公网 IPv6"; return 1; }
+  [[ $1 == 4 && -z $IP4 ]] && { red "这台服务器没有公网 IPv4"; return 1; }
+  LINK_IP=$1; save_ip
+  ls "$STATE"/*.env >/dev/null 2>&1 && gen_clients >/dev/null 2>&1
+  green "节点地址已设为：$(link_label)（链接、二维码、Clash 配置、订阅已更新，客户端需重新导入或更新订阅）"
+}
+set_out_ip() {   # set_out_ip auto|prefer4|prefer6|only4|only6
+  [[ -z $IP4$IP6 ]] && get_ip
+  [[ $1 == only6 && -z $IP6 ]] && { red "这台服务器没有公网 IPv6，不能设为只用 IPv6"; return 1; }
+  [[ $1 == only4 && -z $IP4 ]] && { red "这台服务器没有公网 IPv4，不能设为只用 IPv4"; return 1; }
+  OUT_IP=$1; save_ip
+  local ok=1
+  [[ -f $XRAY_CONF ]] && { apply_xray || ok=0; }
+  [[ -f $SB_CONF ]] && { apply_singbox || ok=0; }
+  has snell && { write_snell_conf; svc restart onekey-snell; }
+  [[ $ok == 1 ]] && green "出站已设为：$(out_label)（节点链接不变，无需重新导入）" || red "部分内核应用失败，见上方信息"
+}
+
+ip_menu() {
+  [[ -z $IP4$IP6 ]] && get_ip
+  echo
+  echo "本机公网：IPv4 ${IP4:-无}    IPv6 ${IP6:-无}"
+  echo "当前设置：节点地址 $(link_label)；出站 $(out_label)"
+  echo
+  echo "  节点地址（链接 / 二维码 / 订阅里用的 IP）"
+  echo "  1) IPv4 + IPv6 都生成"
+  echo "  2) 只用 IPv4"
+  echo "  3) 只用 IPv6"
+  echo "  出站（通过节点访问网站时，对方看到的 IP）"
+  echo "  4) 系统默认"
+  echo "  5) 优先 IPv4"
+  echo "  6) 优先 IPv6"
+  echo "  7) 只用 IPv4"
+  echo "  8) 只用 IPv6"
+  echo "  0) 返回"
+  local c; read -r -p "请选择 [0-8]: " c
+  case $c in
+    1) set_link_ip both ;; 2) set_link_ip 4 ;; 3) set_link_ip 6 ;;
+    4) set_out_ip auto ;; 5) set_out_ip prefer4 ;; 6) set_out_ip prefer6 ;;
+    7) set_out_ip only4 ;; 8) set_out_ip only6 ;;
+  esac
+}
+
 port_used() { ss -Hlntu 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]$1\$"; }
 rand_port() {
   local p
@@ -248,7 +332,8 @@ install_cloudflared() {
   chmod 755 "$BIN_CF"
 }
 
-need_core() {   # 给某个协议装好它需要的内核
+need_core() {   # 给某个协议装好它需要的内核（第一次安装时顺便选 IPv4 / IPv6）
+  first_ip_setup
   case $(core_of "$1") in
     xray)    install_xray ;;
     singbox) install_singbox ;;
@@ -327,8 +412,8 @@ apply_xray() {
   if [[ ${#list[@]} -eq 0 ]]; then drop_core xray; return; fi
   install_xray
   local td; td=$(mktemp -d); tmp=$td/xray.json   # Xray 按扩展名识别配置格式
-  printf '%s\n' "${list[@]}" | jq -s '{log:{loglevel:"warning"},inbounds:.,
-     outbounds:[{protocol:"freedom",tag:"direct"},{protocol:"blackhole",tag:"block"}]}' >"$tmp"
+  printf '%s\n' "${list[@]}" | jq -s --arg ds "$(xray_strategy)" '{log:{loglevel:"warning"},inbounds:.,
+     outbounds:[{protocol:"freedom",tag:"direct",settings:{domainStrategy:$ds}},{protocol:"blackhole",tag:"block"}]}' >"$tmp"
   if ! $BIN_XRAY run -test -c "$tmp" >"$td/err" 2>&1; then
     red "Xray 配置检查失败："; tail -5 "$td/err"; rm -rf "$td"; return 1
   fi
@@ -343,7 +428,8 @@ apply_singbox() {
   if [[ ${#list[@]} -eq 0 ]]; then drop_core singbox; return; fi
   install_singbox
   tmp=$(mktemp)
-  printf '%s\n' "${list[@]}" | jq -s '{log:{level:"warn",timestamp:true},inbounds:.,outbounds:[{type:"direct",tag:"direct"}]}' >"$tmp"
+  printf '%s\n' "${list[@]}" | jq -s --arg st "$(sb_strategy)" '{log:{level:"warn",timestamp:true},inbounds:.,outbounds:[{type:"direct",tag:"direct"}]}
+     + (if $st == "" then {} else {dns:{servers:[{type:"local",tag:"local"}]},route:{default_domain_resolver:{server:"local",strategy:$st}}} end)' >"$tmp"
   if ! $BIN_SB check -c "$tmp" >/dev/null 2>"$tmp.err"; then
     red "sing-box 配置检查失败："; cat "$tmp.err"; rm -f "$tmp" "$tmp.err"; return 1
   fi
@@ -465,20 +551,25 @@ argo_domain() {   # 输出当前 Argo 域名
     done
     echo "$d" )
 }
+write_snell_conf() {
+  ( . "$STATE/snell.env"
+    cat >"$BASE/snell.conf" <<EOF
+[snell-server]
+listen = 0.0.0.0:$PORT$( [[ $LISTEN_ALL == "::" ]] && echo ",[::]:$PORT")
+psk = $PSK
+mode = $MODE
+dns-ip-preference = $(snell_pref)
+EOF
+  )
+  chmod 600 "$BASE/snell.conf"
+}
 add_snell() {
   confirm_overwrite snell "Snell v6" || return
   need_core snell; ask_port "Snell v6" snell
   local psk mode; psk=$(rand_pw 32)
   mode=$(ask "模式 default/unshaped（客户端要一致）" "${MODE:-default}")
   save_state snell PORT="$PORT" PSK="$psk" MODE="$mode"
-  cat >"$BASE/snell.conf" <<EOF
-[snell-server]
-listen = 0.0.0.0:$PORT$( [[ $LISTEN_ALL == "::" ]] && echo ",[::]:$PORT")
-psk = $psk
-mode = $mode
-dns-ip-preference = default
-EOF
-  chmod 600 "$BASE/snell.conf"
+  write_snell_conf
   open_port "$PORT" both; svc restart onekey-snell; sleep 1
   [[ $(svc status onekey-snell) == active ]] || red "snell-server 启动失败"
   show_links snell
@@ -519,10 +610,10 @@ show_links() {   # show_links [协议]  不带参数 = 全部
       [[ $NONINT != 1 ]] && command -v qrencode >/dev/null && qrencode -t ANSIUTF8 "$l"
       continue
     fi
-    for h in $IP4 $IP6; do link_for $p "$h"; done
+    for h in $(link_hosts); do link_for $p "$h"; done
     if [[ $p == snell ]]; then yellow "（上面是 Surge 配置行，粘贴到 [Proxy] 段；Clash / 小火箭不支持 Snell v6）"
     elif [[ $NONINT != 1 ]] && command -v qrencode >/dev/null; then
-      qrencode -t ANSIUTF8 "$(link_for $p "${IP4:-$IP6}")"
+      qrencode -t ANSIUTF8 "$(link_for $p "$(link_hosts | awk '{print $1}')")"
     fi
     case $p in hy2|tuic|anytls) yellow "提示：使用自签证书，客户端需开启「跳过证书验证 / allowInsecure」";; esac
   done
@@ -565,13 +656,13 @@ gen_clients() {   # 生成 links.txt / clash.yaml / 订阅文件
       proxies+="$(clash_proxy argo "$d" "$n")"$'\n'; links+="$(argo_link "$d")"$'\n'
       continue
     fi
-    for h in $IP4 $IP6; do
+    for h in $(link_hosts); do
       n="$NAME_PREFIX-$p$( [[ $h == *:* ]] && echo -v6)"; names+=("$n")
       proxies+="$(clash_proxy $p "$h" "$n")"$'\n'; links+="$(link_for $p "$h")"$'\n'
     done
   done
   # links.txt（含 Snell 的 Surge 行，给自己看 / 测试用）
-  { printf '%s' "$links"; if has snell; then for h in $IP4 $IP6; do link_for snell "$h"; done; fi; } >"$LINKS"
+  { printf '%s' "$links"; if has snell; then for h in $(link_hosts); do link_for snell "$h"; done; fi; } >"$LINKS"
   chmod 600 "$LINKS"
   if [[ ${#names[@]} -eq 0 ]]; then rm -f "$CLASH"; return; fi
   local list; list=$(printf '"%s", ' "${names[@]}"); list=${list%, }
@@ -621,7 +712,7 @@ EOF
 sub_urls() {
   ( . "$SUB_ENV"
     local h hb
-    for h in $IP4 $IP6; do
+    for h in $(link_hosts); do
       hb=$h; [[ $h == *:* ]] && hb="[$h]"
       echo "  小火箭 / v2rayN 订阅：http://$hb:$PORT/$TOKEN/sub"
       echo "  Clash 订阅：        http://$hb:$PORT/$TOKEN/clash.yaml"
@@ -813,6 +904,7 @@ status() {
   [[ -x $BIN_XRAY ]] && echo "Xray 版本：$($BIN_XRAY version | head -1 | awk '{print $2}')"
   [[ -x $BIN_SB ]] && echo "sing-box 版本：$($BIN_SB version | head -1 | awk '{print $3}')"
   echo "拥塞控制：$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+  echo "IP 设置：节点地址 $(link_label)，出站 $(out_label)"
   echo
 }
 
@@ -870,27 +962,29 @@ main_menu() {
     echo "  1) 安装 / 添加协议"
     echo "  2) 查看节点链接"
     echo "  3) 订阅链接（小火箭 / Clash）"
-    echo "  4) 删除某个协议"
-    echo "  5) 重启所有服务"
-    echo "  6) 运行状态"
-    echo "  7) 开启 BBR 加速"
-    echo "  8) TCP 调优"
-    echo "  9) 更新内核（已安装的 Xray / sing-box）"
-    echo " 10) 卸载全部"
+    echo "  4) IP 设置（IPv4 / IPv6）"
+    echo "  5) 删除某个协议"
+    echo "  6) 重启所有服务"
+    echo "  7) 运行状态"
+    echo "  8) 开启 BBR 加速"
+    echo "  9) TCP 调优"
+    echo " 10) 更新内核（已安装的 Xray / sing-box）"
+    echo " 11) 卸载全部"
     echo "  0) 退出"
     echo
-    local c; read -r -p "请选择 [0-10]: " c
+    local c; read -r -p "请选择 [0-11]: " c
     case $c in
       1) proto_menu ;;
       2) show_links ;;
       3) sub_menu ;;
-      4) pick_proto && remove_proto "$PICKED" ;;
-      5) restart_all ;;
-      6) status ;;
-      7) enable_bbr ;;
-      8) tcp_menu ;;
-      9) update_cores ;;
-      10) uninstall_all; exit 0 ;;
+      4) ip_menu ;;
+      5) pick_proto && remove_proto "$PICKED" ;;
+      6) restart_all ;;
+      7) status ;;
+      8) enable_bbr ;;
+      9) tcp_menu ;;
+      10) update_cores ;;
+      11) uninstall_all; exit 0 ;;
       0) exit 0 ;;
     esac
   done
@@ -901,7 +995,7 @@ usage() {
   cat <<EOF
 用法：onekey                 打开菜单
       onekey add <协议>      非交互安装（reality|hy2|tuic|anytls|argo|ss|snell）
-                             可用环境变量：PORT_SET= SNI= METHOD= MODE=
+                             可用环境变量：PORT_SET= SNI= METHOD= MODE= IP_MODE=4|6|both
       onekey links           查看全部链接
       onekey remove <协议>   删除协议
       onekey status          运行状态
@@ -910,6 +1004,8 @@ usage() {
       onekey sub [on|reset|off]  订阅链接（小火箭 / Clash）开启·查看 / 换地址 / 关闭
       onekey clash           输出 Clash 配置
       onekey rebuild         按当前规则重新生成内核配置（升级脚本后用）
+      onekey ip [both|4|6]   节点链接用 IPv4+IPv6 / 只用 IPv4 / 只用 IPv6
+      onekey ip out <auto|prefer4|prefer6|only4|only6>  出站 IP 优先级
       onekey uninstall       卸载全部
 EOF
 }
@@ -928,6 +1024,7 @@ case $1 in
   sub) case $2 in reset) sub_reset ;; off) sub_disable ;; *) sub_enable ;; esac ;;
   clash) gen_clients >/dev/null 2>&1; [[ -f $CLASH ]] && cat "$CLASH" ;;
   rebuild) rebuild ;;
+  ip) case $2 in both|4|6) set_link_ip "$2" ;; out) set_out_ip "${3:-auto}" ;; *) get_ip; echo "节点地址：$(link_label)    出站：$(out_label)    （IPv4 ${IP4:-无}  IPv6 ${IP6:-无}）" ;; esac ;;
   uninstall) NONINT=1 uninstall_all ;;
   -v|--version) echo "$ONEKEY_VER" ;;
   *) usage ;;
