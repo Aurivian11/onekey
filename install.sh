@@ -1,0 +1,934 @@
+#!/usr/bin/env bash
+# =============================================================
+#  OneKey 多协议节点一键脚本
+#  协议：VLESS-REALITY / Hysteria2 / TUIC / AnyTLS / VLESS-Argo /
+#        Shadowsocks / Snell v6
+#  内核：Xray（REALITY / Hysteria2 / Argo / SS）+ sing-box（TUIC / AnyTLS）
+#        + snell-server + cloudflared；内核只在选择协议时才安装
+#  系统：Debian / Ubuntu / Alpine（OpenRC）/ CentOS 系
+# =============================================================
+set -o pipefail
+
+ONEKEY_VER="1.0.0"
+# 一键安装时脚本会从这里下载自己，安装成 onekey 命令
+SCRIPT_URL="${ONEKEY_URL:-https://raw.githubusercontent.com/Aurivian11/onekey/main/install.sh}"
+
+BASE=/etc/onekey
+STATE=$BASE/state
+SB_CONF=$BASE/sing-box.json
+XRAY_CONF=$BASE/xray.json
+CERT_DIR=$BASE/cert
+LINKS=$BASE/links.txt
+ARGO_LOG=$BASE/argo.log
+BIN_SB=/usr/local/bin/sing-box
+BIN_XRAY=/usr/local/bin/xray
+BIN_SNELL=/usr/local/bin/snell-server
+BIN_CF=/usr/local/bin/cloudflared
+CMD=/usr/local/bin/onekey
+
+SNELL_VER="${SNELL_VER:-v6.0.0}"
+DEF_REALITY_SNI="www.amd.com"
+DEF_TLS_SNI="www.bing.com"
+
+red()    { printf '\033[31m%s\033[0m\n' "$*"; }
+green()  { printf '\033[32m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
+blue()   { printf '\033[36m%s\033[0m\n' "$*"; }
+die()    { red "错误：$*"; exit 1; }
+
+NONINT=${NONINT:-0}   # 1 = 非交互，全部用默认值
+ask() {   # ask "提示" 默认值 -> 输出结果
+  local prompt=$1 def=$2 ans
+  if [[ $NONINT == 1 ]]; then echo "$def"; return; fi
+  read -r -p "$prompt [默认 $def]: " ans
+  echo "${ans:-$def}"
+}
+
+# ---------------- 环境检测 ----------------
+[[ $EUID -eq 0 ]] || die "请用 root 运行"
+
+detect_os() {
+  OS_ID=$( [[ -f /etc/os-release ]] && . /etc/os-release; echo "${ID:-unknown}" )
+  if command -v apk >/dev/null 2>&1; then PKG=apk
+  elif command -v apt-get >/dev/null 2>&1; then PKG=apt
+  elif command -v dnf >/dev/null 2>&1; then PKG=dnf
+  elif command -v yum >/dev/null 2>&1; then PKG=yum
+  else die "不支持的系统（找不到 apt/apk/dnf/yum）"; fi
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then INIT=systemd
+  elif command -v rc-service >/dev/null 2>&1; then INIT=openrc
+  else die "需要 systemd 或 OpenRC"; fi
+  case $(uname -m) in
+    x86_64|amd64) ARCH=amd64; SNELL_ARCH=amd64; CF_ARCH=amd64 ;;
+    aarch64|arm64) ARCH=arm64; SNELL_ARCH=aarch64; CF_ARCH=arm64 ;;
+    *) die "不支持的架构：$(uname -m)" ;;
+  esac
+}
+
+install_deps() {
+  local need=0 c
+  for c in curl jq openssl qrencode tar unzip ss; do command -v $c >/dev/null 2>&1 || need=1; done
+  [[ $need == 0 ]] && return
+  yellow "安装依赖..."
+  case $PKG in
+    apt) apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl jq openssl qrencode tar unzip iproute2 ca-certificates >/dev/null ;;
+    apk) apk add --no-cache bash curl jq openssl libqrencode-tools tar unzip iproute2 ca-certificates >/dev/null ;;
+    dnf|yum) $PKG install -y -q epel-release >/dev/null 2>&1; $PKG install -y -q curl jq openssl qrencode tar unzip iproute >/dev/null ;;
+  esac
+  for c in curl jq openssl tar; do command -v $c >/dev/null 2>&1 || die "依赖 $c 安装失败"; done
+}
+
+get_ip() {
+  IP4=$(curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null || curl -4 -fsS --max-time 6 https://ipv4.icanhazip.com 2>/dev/null)
+  IP6=$(curl -6 -fsS --max-time 6 https://api64.ipify.org 2>/dev/null || curl -6 -fsS --max-time 6 https://ipv6.icanhazip.com 2>/dev/null)
+  IP4=$(echo "$IP4" | tr -d '[:space:]'); IP6=$(echo "$IP6" | tr -d '[:space:]')
+  [[ $IP6 == *:* ]] || IP6=""
+  [[ $IP4 == *.* ]] || IP4=""
+  [[ -n $IP4 || -n $IP6 ]] || die "获取公网 IP 失败"
+}
+
+port_used() { ss -Hlntu 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]$1\$"; }
+rand_port() {
+  local p
+  for _ in $(seq 1 50); do
+    p=$(( (RANDOM << 15 | RANDOM) % 50001 + 10000 ))
+    port_used "$p" || { echo "$p"; return; }
+  done
+  echo 34567
+}
+ask_port() {   # ask_port 名称 协议 -> PORT（环境变量 PORT_SET 可指定端口）
+  local def; def=${PORT_SET:-$(rand_port)}
+  while :; do
+    PORT=$(ask "$1 端口" "$def")
+    [[ $PORT =~ ^[0-9]+$ ]] && (( PORT > 0 && PORT < 65536 )) || { red "端口无效"; [[ $NONINT == 1 ]] && die "端口无效"; continue; }
+    port_used "$PORT" && ! grep -qs "PORT='$PORT'" "$STATE/$2.env" && { red "端口 $PORT 已被占用"; [[ $NONINT == 1 ]] && die "端口被占用"; continue; }
+    break
+  done
+}
+
+open_port() {   # open_port 端口 tcp|udp|both
+  local p=$1 t=$2
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    [[ $t != udp ]] && ufw allow "$p"/tcp >/dev/null
+    [[ $t != tcp ]] && ufw allow "$p"/udp >/dev/null
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    [[ $t != udp ]] && firewall-cmd -q --permanent --add-port="$p"/tcp
+    [[ $t != tcp ]] && firewall-cmd -q --permanent --add-port="$p"/udp
+    firewall-cmd -q --reload
+  fi
+}
+
+uri() { jq -rn --arg s "$1" '$s|@uri'; }
+b64url() { printf '%s' "$1" | base64 | tr -d '\n=' | tr '+/' '-_'; }
+rand_hex() { openssl rand -hex "$1"; }
+rand_pw() { openssl rand -base64 24 | tr -d '/+=\n' | cut -c1-"${1:-24}"; }
+
+# ---------------- 服务管理 ----------------
+svc_write() {   # svc_write 名称 "命令" [日志文件]
+  local name=$1 cmd=$2 log=$3
+  if [[ $INIT == systemd ]]; then
+    cat >/etc/systemd/system/$name.service <<EOF
+[Unit]
+Description=OneKey $name
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=$cmd
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+${log:+StandardOutput=append:$log}
+${log:+StandardError=append:$log}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable "$name" >/dev/null 2>&1
+  else
+    local bin=${cmd%% *} args=${cmd#* }
+    cat >/etc/init.d/$name <<EOF
+#!/sbin/openrc-run
+name="$name"
+command="$bin"
+command_args="$args"
+command_background=true
+pidfile="/run/$name.pid"
+${log:+output_log="$log"}
+${log:+error_log="$log"}
+depend() { need net; }
+EOF
+    chmod +x /etc/init.d/$name
+    rc-update add "$name" default >/dev/null 2>&1
+  fi
+}
+svc() {   # svc start|stop|restart|status 名称
+  if [[ $INIT == systemd ]]; then
+    case $1 in
+      status) systemctl is-active "$2" 2>/dev/null ;;
+      *) systemctl "$1" "$2" >/dev/null 2>&1 ;;
+    esac
+  else
+    case $1 in
+      status) rc-service "$2" status 2>/dev/null | grep -q started && echo active || echo inactive ;;
+      *) rc-service "$2" "$1" >/dev/null 2>&1 ;;
+    esac
+  fi
+}
+svc_remove() {
+  svc stop "$1"
+  if [[ $INIT == systemd ]]; then
+    systemctl disable "$1" >/dev/null 2>&1; rm -f /etc/systemd/system/$1.service; systemctl daemon-reload
+  else
+    rc-update del "$1" default >/dev/null 2>&1; rm -f /etc/init.d/$1
+  fi
+}
+
+# ---------------- 内核安装（按需） ----------------
+# Xray 支持的协议用 Xray，不支持的用 sing-box；Snell 用官方 snell-server
+# 内核只在选择对应协议时才下载，没有协议使用时自动删除
+core_of() {
+  case $1 in
+    reality|argo|ss|hy2) echo xray ;;
+    tuic|anytls)         echo singbox ;;
+    snell)               echo snell ;;
+  esac
+}
+XRAY_PROTOS=(reality hy2 argo ss)
+# 系统没有 IPv6（或内核关闭了 IPv6）时只监听 IPv4，否则双栈
+[[ -f /proc/net/if_inet6 ]] && LISTEN_ALL="::" || LISTEN_ALL="0.0.0.0"
+SB_PROTOS=(tuic anytls)
+
+gh_latest() { curl -fsSL "https://api.github.com/repos/$1/releases/latest" | jq -r .tag_name; }
+
+install_xray() {
+  [[ -x $BIN_XRAY && $1 != force ]] && return
+  yellow "下载 Xray 内核..."
+  local tag tmp asset
+  tag=$(gh_latest XTLS/Xray-core); [[ $tag == v* ]] || die "获取 Xray 版本失败"
+  [[ $ARCH == amd64 ]] && asset=Xray-linux-64.zip || asset=Xray-linux-arm64-v8a.zip
+  tmp=$(mktemp -d)
+  curl -fsSL -o "$tmp/x.zip" "https://github.com/XTLS/Xray-core/releases/download/$tag/$asset" || die "下载 Xray 失败"
+  unzip -o -q "$tmp/x.zip" xray -d "$tmp" || die "解压 Xray 失败"
+  install -m 755 "$tmp/xray" "$BIN_XRAY"; rm -rf "$tmp"
+  green "Xray $($BIN_XRAY version | head -1 | awk '{print $2}') 已安装"
+  svc_write onekey-xray "$BIN_XRAY run -c $XRAY_CONF"
+}
+
+install_singbox() {
+  [[ -x $BIN_SB && $1 != force ]] && return
+  yellow "下载 sing-box 内核..."
+  local tag ver suffix="" tmp
+  tag=$(gh_latest SagerNet/sing-box); [[ $tag == v* ]] || die "获取 sing-box 版本失败"
+  ver=${tag#v}
+  [[ $PKG == apk ]] && suffix="-musl"
+  tmp=$(mktemp -d)
+  curl -fsSL -o "$tmp/sb.tgz" "https://github.com/SagerNet/sing-box/releases/download/$tag/sing-box-$ver-linux-$ARCH$suffix.tar.gz" || die "下载 sing-box 失败"
+  tar -xzf "$tmp/sb.tgz" -C "$tmp" || die "解压失败"
+  install -m 755 "$tmp"/sing-box-*/sing-box "$BIN_SB"; rm -rf "$tmp"
+  green "sing-box $($BIN_SB version | head -1 | awk '{print $3}') 已安装"
+  svc_write onekey-sb "$BIN_SB run -c $SB_CONF"
+}
+
+install_snell() {
+  [[ -x $BIN_SNELL ]] && return
+  yellow "下载 snell-server $SNELL_VER..."
+  [[ $PKG == apk ]] && apk add --no-cache gcompat libstdc++ >/dev/null
+  local tmp; tmp=$(mktemp -d)
+  curl -fsSL -o "$tmp/s.zip" "https://dl.nssurge.com/snell/snell-server-$SNELL_VER-linux-$SNELL_ARCH.zip" || die "下载 snell-server 失败"
+  unzip -o -q "$tmp/s.zip" -d "$tmp" && install -m 755 "$tmp/snell-server" "$BIN_SNELL"
+  rm -rf "$tmp"
+  svc_write onekey-snell "$BIN_SNELL -c $BASE/snell.conf"
+}
+
+install_cloudflared() {
+  [[ -x $BIN_CF ]] && return
+  yellow "下载 cloudflared..."
+  curl -fsSL -o "$BIN_CF" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$CF_ARCH" || die "下载 cloudflared 失败"
+  chmod 755 "$BIN_CF"
+}
+
+need_core() {   # 给某个协议装好它需要的内核
+  case $(core_of "$1") in
+    xray)    install_xray ;;
+    singbox) install_singbox ;;
+    snell)   install_snell ;;
+  esac
+}
+
+gen_cert() {
+  [[ -f $CERT_DIR/cert.pem ]] && return
+  mkdir -p "$CERT_DIR"
+  openssl ecparam -genkey -name prime256v1 -out "$CERT_DIR/key.pem" 2>/dev/null
+  openssl req -new -x509 -days 3650 -key "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" -subj "/CN=$DEF_TLS_SNI" 2>/dev/null
+}
+
+# 不依赖内核的密钥生成
+gen_uuid() { cat /proc/sys/kernel/random/uuid; }
+gen_x25519() {   # 输出 "私钥 公钥"（base64url，REALITY 通用格式）
+  local k; k=$(openssl genpkey -algorithm X25519 2>/dev/null) || die "openssl 不支持 X25519"
+  printf '%s %s\n' \
+    "$(echo "$k" | openssl pkey -outform DER 2>/dev/null | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=\n')" \
+    "$(echo "$k" | openssl pkey -pubout -outform DER 2>/dev/null | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=\n')"
+}
+
+# ---------------- 状态 & 配置 ----------------
+save_state() {   # save_state 协议 KEY=VAL ...
+  local f=$STATE/$1.env; shift
+  mkdir -p "$STATE"; : >"$f"; chmod 600 "$f"
+  local kv; for kv in "$@"; do printf "%s='%s'\n" "${kv%%=*}" "${kv#*=}" >>"$f"; done
+}
+has() { [[ -f $STATE/$1.env ]]; }
+
+xray_inbound() {   # Xray inbound JSON
+  local p=$1; ( . "$STATE/$p.env"
+  case $p in
+    reality) jq -nc --arg la "$LISTEN_ALL" --argjson port "$PORT" --arg u "$UUID" --arg sni "$SNI" --arg pk "$PRIV" --arg sid "$SID" \
+      '{tag:"vless-reality",listen:$la,port:$port,protocol:"vless",
+        settings:{clients:[{id:$u,flow:"xtls-rprx-vision"}],decryption:"none"},
+        streamSettings:{network:"tcp",security:"reality",
+          realitySettings:{show:false,target:($sni+":443"),xver:0,serverNames:[$sni],privateKey:$pk,shortIds:[$sid]}}}' ;;
+    hy2) jq -nc --arg la "$LISTEN_ALL" --argjson port "$PORT" --arg pw "$PASS" --arg c "$CERT_DIR/cert.pem" --arg k "$CERT_DIR/key.pem" \
+      '{tag:"hysteria2",listen:$la,port:$port,protocol:"hysteria",
+        settings:{version:2,clients:[{auth:$pw}]},
+        streamSettings:{network:"hysteria",hysteriaSettings:{version:2},security:"tls",
+          tlsSettings:{alpn:["h3"],certificates:[{certificateFile:$c,keyFile:$k}]}}}' ;;
+    argo) jq -nc --arg la "$LISTEN_ALL" --argjson port "$PORT" --arg u "$UUID" --arg path "$WSPATH" \
+      '{tag:"vless-argo",listen:"127.0.0.1",port:$port,protocol:"vless",
+        settings:{clients:[{id:$u}],decryption:"none"},
+        streamSettings:{network:"ws",wsSettings:{path:$path}}}' ;;
+    ss) jq -nc --arg la "$LISTEN_ALL" --argjson port "$PORT" --arg m "$METHOD" --arg pw "$PASS" \
+      '{tag:"shadowsocks",listen:$la,port:$port,protocol:"shadowsocks",
+        settings:{method:$m,password:$pw,network:"tcp,udp"}}' ;;
+  esac )
+}
+
+sb_inbound() {   # sing-box inbound JSON
+  local p=$1; ( . "$STATE/$p.env"
+  local tls; tls=$(jq -nc --arg c "$CERT_DIR/cert.pem" --arg k "$CERT_DIR/key.pem" '{enabled:true,alpn:["h3"],certificate_path:$c,key_path:$k}')
+  case $p in
+    tuic) jq -nc --arg la "$LISTEN_ALL" --argjson port "$PORT" --arg u "$UUID" --arg pw "$PASS" --argjson tls "$tls" \
+      '{type:"tuic",tag:"tuic",listen:$la,listen_port:$port,users:[{uuid:$u,password:$pw}],congestion_control:"bbr",tls:$tls}' ;;
+    anytls) jq -nc --arg la "$LISTEN_ALL" --argjson port "$PORT" --arg pw "$PASS" --argjson tls "$tls" \
+      '{type:"anytls",tag:"anytls",listen:$la,listen_port:$port,users:[{name:"onekey",password:$pw}],tls:($tls|del(.alpn))}' ;;
+  esac )
+}
+
+drop_core() {   # 没有协议用到时，停掉并删除该内核
+  case $1 in
+    xray)    [[ -x $BIN_XRAY ]] || return; svc_remove onekey-xray; rm -f "$BIN_XRAY" "$XRAY_CONF"; yellow "已没有协议使用 Xray，内核已删除" ;;
+    singbox) [[ -x $BIN_SB ]] || return; svc_remove onekey-sb; rm -f "$BIN_SB" "$SB_CONF"; yellow "已没有协议使用 sing-box，内核已删除" ;;
+  esac
+}
+
+apply_xray() {
+  local p list=() tmp
+  for p in "${XRAY_PROTOS[@]}"; do has $p && list+=("$(xray_inbound $p)"); done
+  if [[ ${#list[@]} -eq 0 ]]; then drop_core xray; return; fi
+  install_xray
+  local td; td=$(mktemp -d); tmp=$td/xray.json   # Xray 按扩展名识别配置格式
+  printf '%s\n' "${list[@]}" | jq -s '{log:{loglevel:"warning"},inbounds:.,
+     outbounds:[{protocol:"freedom",tag:"direct"},{protocol:"blackhole",tag:"block"}]}' >"$tmp"
+  if ! $BIN_XRAY run -test -c "$tmp" >"$td/err" 2>&1; then
+    red "Xray 配置检查失败："; tail -5 "$td/err"; rm -rf "$td"; return 1
+  fi
+  install -m 600 "$tmp" "$XRAY_CONF"; rm -rf "$td"
+  svc restart onekey-xray; sleep 1
+  [[ $(svc status onekey-xray) == active ]] || { red "Xray 启动失败，查看日志：journalctl -u onekey-xray -n 30"; return 1; }
+}
+
+apply_singbox() {
+  local p list=() tmp
+  for p in "${SB_PROTOS[@]}"; do has $p && list+=("$(sb_inbound $p)"); done
+  if [[ ${#list[@]} -eq 0 ]]; then drop_core singbox; return; fi
+  install_singbox
+  tmp=$(mktemp)
+  printf '%s\n' "${list[@]}" | jq -s '{log:{level:"warn",timestamp:true},inbounds:.,outbounds:[{type:"direct",tag:"direct"}]}' >"$tmp"
+  if ! $BIN_SB check -c "$tmp" >/dev/null 2>"$tmp.err"; then
+    red "sing-box 配置检查失败："; cat "$tmp.err"; rm -f "$tmp" "$tmp.err"; return 1
+  fi
+  install -m 600 "$tmp" "$SB_CONF"; rm -f "$tmp" "$tmp.err"
+  svc restart onekey-sb; sleep 1
+  [[ $(svc status onekey-sb) == active ]] || { red "sing-box 启动失败，查看日志：journalctl -u onekey-sb -n 30"; return 1; }
+}
+
+apply_core_of() {   # 只重载某协议所属的内核
+  case $(core_of "$1") in xray) apply_xray ;; singbox) apply_singbox ;; esac
+}
+
+rebuild() {   # 按「Xray 优先」重新分配内核（旧版全用 sing-box 的安装可用它迁移）
+  local ok=1
+  apply_singbox || ok=0   # 先让 sing-box 释放已归 Xray 的端口
+  apply_xray || ok=0
+  if has argo && [[ $(svc status onekey-argo) != active ]]; then argo_service >/dev/null; fi
+  gen_clients >/dev/null 2>&1
+  if [[ $ok == 1 ]]; then green "已按当前规则重建：Xray 负责 REALITY / Hysteria2 / Argo / SS，sing-box 负责 TUIC / AnyTLS"
+  else red "重建时有内核出错，见上方信息"; return 1; fi
+}
+
+update_cores() {
+  local any=0
+  [[ -x $BIN_XRAY ]] && { any=1; install_xray force; [[ -f $XRAY_CONF ]] && svc restart onekey-xray; }
+  [[ -x $BIN_SB ]]   && { any=1; install_singbox force; [[ -f $SB_CONF ]] && svc restart onekey-sb; }
+  [[ $any == 0 ]] && yellow "还没有安装任何内核（选择协议时才会安装）"
+}
+
+# ---------------- 各协议安装 ----------------
+confirm_overwrite() {
+  has "$1" || return 0
+  [[ $NONINT == 1 ]] && return 0
+  local a; read -r -p "$2 已存在，覆盖重装？[y/N]: " a
+  [[ $a == [yY] ]]
+}
+
+add_reality() {
+  confirm_overwrite reality VLESS-REALITY || return
+  need_core reality; ask_port "VLESS-REALITY" reality
+  local sni kp; sni=$(ask "伪装域名 (SNI)" "${SNI:-$DEF_REALITY_SNI}")
+  kp=$(gen_x25519)
+  save_state reality PORT="$PORT" UUID="$(gen_uuid)" SNI="$sni" PRIV="${kp%% *}" PUB="${kp##* }" SID="$(rand_hex 8)"
+  open_port "$PORT" tcp; apply_xray && show_links reality
+}
+add_hy2() {
+  confirm_overwrite hy2 Hysteria2 || return
+  need_core hy2; gen_cert; ask_port "Hysteria2 (UDP)" hy2
+  save_state hy2 PORT="$PORT" PASS="$(rand_pw 24)"
+  open_port "$PORT" udp; apply_xray && show_links hy2
+}
+add_tuic() {
+  confirm_overwrite tuic TUIC || return
+  need_core tuic; gen_cert; ask_port "TUIC (UDP)" tuic
+  save_state tuic PORT="$PORT" UUID="$(gen_uuid)" PASS="$(rand_pw 16)"
+  open_port "$PORT" udp; apply_singbox && show_links tuic
+}
+add_anytls() {
+  confirm_overwrite anytls AnyTLS || return
+  need_core anytls; gen_cert; ask_port "AnyTLS" anytls
+  save_state anytls PORT="$PORT" PASS="$(rand_pw 24)"
+  open_port "$PORT" tcp; apply_singbox && show_links anytls
+}
+add_ss() {
+  confirm_overwrite ss Shadowsocks || return
+  need_core ss; ask_port "Shadowsocks" ss
+  local m pw
+  if [[ $NONINT == 1 ]]; then m=${METHOD:-aes-256-gcm}
+  else
+    echo "加密方式："
+    echo "  1) aes-256-gcm（默认，3x-ui 落地常用）"
+    echo "  2) chacha20-ietf-poly1305"
+    echo "  3) 2022-blake3-aes-128-gcm"
+    case $(ask "请选择" 1) in 2) m=chacha20-ietf-poly1305 ;; 3) m=2022-blake3-aes-128-gcm ;; *) m=aes-256-gcm ;; esac
+  fi
+  if [[ $m == 2022-* ]]; then pw=$(openssl rand -base64 16); else pw=$(rand_pw 24); fi
+  save_state ss PORT="$PORT" METHOD="$m" PASS="$pw"
+  open_port "$PORT" both; apply_xray && show_links ss
+}
+add_argo() {
+  confirm_overwrite argo VLESS-Argo || return
+  need_core argo; install_cloudflared
+  local port token="" domain=""
+  port=$(rand_port)
+  if [[ $NONINT != 1 ]]; then
+    echo "Argo 隧道类型："
+    echo "  1) 临时隧道（默认，免账号，重启后域名会变）"
+    echo "  2) 固定隧道（需要 Cloudflare Tunnel Token 和自己的域名）"
+    if [[ $(ask "请选择" 1) == 2 ]]; then
+      read -r -p "粘贴 Tunnel Token: " token
+      read -r -p "隧道绑定的域名（如 argo.example.com）: " domain
+      yellow "请在 Cloudflare 后台把该域名的服务指向 http://localhost:$port"
+    fi
+  fi
+  save_state argo PORT="$port" UUID="$(gen_uuid)" WSPATH="/$(rand_hex 6)" TOKEN="$token" DOMAIN="$domain"
+  apply_xray || return
+  argo_service
+  show_links argo
+}
+argo_service() {   # 按 argo.env 创建 / 重启 cloudflared 隧道服务
+  install_cloudflared
+  ( . "$STATE/argo.env"
+    if [[ -n $TOKEN ]]; then
+      svc_write onekey-argo "$BIN_CF tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token $TOKEN" "$ARGO_LOG"
+    else
+      svc_write onekey-argo "$BIN_CF tunnel --no-autoupdate --edge-ip-version auto --protocol http2 --url http://127.0.0.1:$PORT" "$ARGO_LOG"
+    fi )
+  : >"$ARGO_LOG"; svc restart onekey-argo
+  yellow "等待 Argo 隧道建立..."
+  argo_domain >/dev/null
+}
+argo_domain() {   # 输出当前 Argo 域名
+  ( . "$STATE/argo.env"
+    if [[ -n $DOMAIN ]]; then echo "$DOMAIN"; return; fi
+    local d=""
+    for _ in $(seq 1 30); do
+      d=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$ARGO_LOG" 2>/dev/null | tail -1 | sed 's#https://##')
+      [[ -n $d ]] && break; sleep 1
+    done
+    echo "$d" )
+}
+add_snell() {
+  confirm_overwrite snell "Snell v6" || return
+  need_core snell; ask_port "Snell v6" snell
+  local psk mode; psk=$(rand_pw 32)
+  mode=$(ask "模式 default/unshaped（客户端要一致）" "${MODE:-default}")
+  save_state snell PORT="$PORT" PSK="$psk" MODE="$mode"
+  cat >"$BASE/snell.conf" <<EOF
+[snell-server]
+listen = 0.0.0.0:$PORT$( [[ $LISTEN_ALL == "::" ]] && echo ",[::]:$PORT")
+psk = $psk
+mode = $mode
+dns-ip-preference = default
+EOF
+  chmod 600 "$BASE/snell.conf"
+  open_port "$PORT" both; svc restart onekey-snell; sleep 1
+  [[ $(svc status onekey-snell) == active ]] || red "snell-server 启动失败"
+  show_links snell
+}
+
+# ---------------- 链接输出 ----------------
+NAME_PREFIX=${NAME_PREFIX:-$(hostname -s 2>/dev/null)}
+[[ -z $NAME_PREFIX || $NAME_PREFIX == localhost* ]] && NAME_PREFIX=onekey
+link_for() {   # link_for 协议 主机 -> 链接
+  local p=$1 h=$2 hb=$2
+  [[ $h == *:* ]] && hb="[$h]"
+  ( . "$STATE/$p.env"
+  local tag; tag=$(uri "$NAME_PREFIX-$p$( [[ $h == *:* ]] && echo -v6)")
+  case $p in
+    reality) echo "vless://$UUID@$hb:$PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$SNI&fp=chrome&pbk=$PUB&sid=$SID&type=tcp&headerType=none#$tag" ;;
+    hy2)     echo "hysteria2://$PASS@$hb:$PORT?sni=$DEF_TLS_SNI&alpn=h3&insecure=1&allowInsecure=1#$tag" ;;
+    tuic)    echo "tuic://$UUID:$PASS@$hb:$PORT?sni=$DEF_TLS_SNI&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1&allowInsecure=1#$tag" ;;
+    anytls)  echo "anytls://$PASS@$hb:$PORT?sni=$DEF_TLS_SNI&insecure=1&allowInsecure=1#$tag" ;;
+    ss)      echo "ss://$(b64url "$METHOD:$PASS")@$hb:$PORT#$tag" ;;
+    snell)   echo "$NAME_PREFIX-snell$( [[ $h == *:* ]] && echo -v6) = snell, $h, $PORT, psk=$PSK, version=6, reuse=true$( [[ $MODE != default ]] && echo ", mode=$MODE")" ;;
+  esac )
+}
+pretty() { case $1 in reality) echo VLESS-REALITY;; hy2) echo Hysteria2;; tuic) echo TUIC;; anytls) echo AnyTLS;; argo) echo VLESS-Argo;; ss) echo Shadowsocks;; snell) echo "Snell v6";; esac; }
+
+argo_link() { ( . "$STATE/argo.env"; echo "vless://$UUID@$1:443?encryption=none&security=tls&sni=$1&fp=chrome&type=ws&host=$1&path=$(uri "$WSPATH")#$(uri "$NAME_PREFIX-argo")" ); }
+
+show_links() {   # show_links [协议]  不带参数 = 全部
+  [[ -z $IP4$IP6 ]] && get_ip
+  local p list=("$@") l
+  [[ ${#list[@]} -eq 0 ]] && list=(reality hy2 tuic anytls argo ss snell)
+  for p in "${list[@]}"; do
+    has $p || continue
+    echo; blue "========== $(pretty $p) =========="
+    if [[ $p == argo ]]; then
+      local d; d=$(argo_domain)
+      if [[ -z $d ]]; then red "Argo 域名还没拿到，稍后运行 onekey 再查看"; continue; fi
+      l=$(argo_link "$d"); echo "$l"
+      [[ $NONINT != 1 ]] && command -v qrencode >/dev/null && qrencode -t ANSIUTF8 "$l"
+      continue
+    fi
+    for h in $IP4 $IP6; do link_for $p "$h"; done
+    if [[ $p == snell ]]; then yellow "（上面是 Surge 配置行，粘贴到 [Proxy] 段；Clash / 小火箭不支持 Snell v6）"
+    elif [[ $NONINT != 1 ]] && command -v qrencode >/dev/null; then
+      qrencode -t ANSIUTF8 "$(link_for $p "${IP4:-$IP6}")"
+    fi
+    case $p in hy2|tuic|anytls) yellow "提示：使用自签证书，客户端需开启「跳过证书验证 / allowInsecure」";; esac
+  done
+  gen_clients
+  echo
+  blue "---------- 导入客户端 ----------"
+  echo "小火箭 Shadowrocket：扫上面的二维码，或复制链接后打开小火箭自动识别"
+  echo "Clash（Verge / Meta / mihomo）：配置文件已生成 $CLASH"
+  if sub_on; then sub_urls; else echo "想用「订阅链接」一键导入：主菜单 3 开启订阅"; fi
+  echo
+}
+
+# ---------------- 客户端配置 / 订阅 ----------------
+CLASH=$BASE/clash.yaml
+SUB_ENV=$BASE/sub.env
+WWW=$BASE/www
+sub_on() { [[ -f $SUB_ENV ]]; }
+
+clash_proxy() {   # clash_proxy 协议 主机 名称 -> 一行 YAML
+  local p=$1 h=$2 n=$3
+  ( . "$STATE/$p.env"
+  case $p in
+    reality) echo "  - {name: \"$n\", type: vless, server: \"$h\", port: $PORT, uuid: \"$UUID\", network: tcp, udp: true, tls: true, flow: xtls-rprx-vision, servername: \"$SNI\", client-fingerprint: chrome, reality-opts: {public-key: \"$PUB\", short-id: \"$SID\"}}" ;;
+    hy2)     echo "  - {name: \"$n\", type: hysteria2, server: \"$h\", port: $PORT, password: \"$PASS\", sni: \"$DEF_TLS_SNI\", skip-cert-verify: true, alpn: [h3]}" ;;
+    tuic)    echo "  - {name: \"$n\", type: tuic, server: \"$h\", port: $PORT, uuid: \"$UUID\", password: \"$PASS\", sni: \"$DEF_TLS_SNI\", skip-cert-verify: true, alpn: [h3], congestion-controller: bbr, udp-relay-mode: native}" ;;
+    anytls)  echo "  - {name: \"$n\", type: anytls, server: \"$h\", port: $PORT, password: \"$PASS\", sni: \"$DEF_TLS_SNI\", skip-cert-verify: true, client-fingerprint: chrome, udp: true}" ;;
+    ss)      echo "  - {name: \"$n\", type: ss, server: \"$h\", port: $PORT, cipher: $METHOD, password: \"$PASS\", udp: true}" ;;
+    argo)    echo "  - {name: \"$n\", type: vless, server: \"$h\", port: 443, uuid: \"$UUID\", udp: true, tls: true, servername: \"$h\", client-fingerprint: chrome, network: ws, ws-opts: {path: \"$WSPATH\", headers: {Host: \"$h\"}}}" ;;
+  esac )
+}
+
+gen_clients() {   # 生成 links.txt / clash.yaml / 订阅文件
+  [[ -z $IP4$IP6 ]] && get_ip
+  local p h n d links="" proxies="" names=()
+  for p in reality hy2 tuic anytls argo ss; do
+    has $p || continue
+    if [[ $p == argo ]]; then
+      d=$(argo_domain); [[ -n $d ]] || continue
+      n="$NAME_PREFIX-argo"; names+=("$n")
+      proxies+="$(clash_proxy argo "$d" "$n")"$'\n'; links+="$(argo_link "$d")"$'\n'
+      continue
+    fi
+    for h in $IP4 $IP6; do
+      n="$NAME_PREFIX-$p$( [[ $h == *:* ]] && echo -v6)"; names+=("$n")
+      proxies+="$(clash_proxy $p "$h" "$n")"$'\n'; links+="$(link_for $p "$h")"$'\n'
+    done
+  done
+  # links.txt（含 Snell 的 Surge 行，给自己看 / 测试用）
+  { printf '%s' "$links"; if has snell; then for h in $IP4 $IP6; do link_for snell "$h"; done; fi; } >"$LINKS"
+  chmod 600 "$LINKS"
+  if [[ ${#names[@]} -eq 0 ]]; then rm -f "$CLASH"; return; fi
+  local list; list=$(printf '"%s", ' "${names[@]}"); list=${list%, }
+  cat >"$CLASH" <<EOF
+# OneKey 生成的 Clash Meta / mihomo 配置（Clash Verge Rev、Clash Meta for Android、Stash 可用）
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: true
+unified-delay: true
+tcp-concurrent: true
+geodata-mode: true
+geox-url:
+  geoip: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat"
+  geosite: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat"
+  mmdb: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country.mmdb"
+dns:
+  enable: true
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - https://223.5.5.5/dns-query
+    - https://1.12.12.12/dns-query
+proxies:
+${proxies%$'\n'}
+proxy-groups:
+  - {name: "节点选择", type: select, proxies: ["自动选择", $list, DIRECT]}
+  - {name: "自动选择", type: url-test, url: "https://www.gstatic.com/generate_204", interval: 300, tolerance: 50, proxies: [$list]}
+rules:
+  - GEOIP,LAN,DIRECT,no-resolve
+  - GEOSITE,cn,DIRECT
+  - GEOIP,CN,DIRECT,no-resolve
+  - MATCH,节点选择
+EOF
+  chmod 600 "$CLASH"
+  if sub_on; then
+    ( . "$SUB_ENV"
+      mkdir -p "$WWW/$TOKEN"; rm -f "$WWW/$TOKEN"/*
+      cp "$CLASH" "$WWW/$TOKEN/clash.yaml"
+      printf '%s' "$links" | base64 | tr -d '\n' >"$WWW/$TOKEN/sub"
+      chmod -R go-rwx "$WWW" )
+  fi
+}
+
+sub_urls() {
+  ( . "$SUB_ENV"
+    local h hb
+    for h in $IP4 $IP6; do
+      hb=$h; [[ $h == *:* ]] && hb="[$h]"
+      echo "  小火箭 / v2rayN 订阅：http://$hb:$PORT/$TOKEN/sub"
+      echo "  Clash 订阅：        http://$hb:$PORT/$TOKEN/clash.yaml"
+    done )
+}
+
+httpd_cmd() {   # 找到可用的 busybox httpd（Debian 在 busybox 里，Alpine 在 busybox-extras 里）
+  if command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx httpd; then echo "$(command -v busybox) httpd"
+  elif command -v busybox-extras >/dev/null 2>&1; then echo "$(command -v busybox-extras) httpd"; fi
+}
+sub_enable() {
+  [[ -z $IP4$IP6 ]] && get_ip
+  if ! sub_on; then
+    local httpd; httpd=$(httpd_cmd)
+    if [[ -z $httpd ]]; then
+      case $PKG in apt) apt-get install -y -qq busybox >/dev/null ;; apk) apk add --no-cache busybox-extras >/dev/null ;; dnf|yum) $PKG install -y -q busybox >/dev/null ;; esac
+      httpd=$(httpd_cmd)
+    fi
+    [[ -n $httpd ]] || { red "安装 busybox httpd 失败"; return 1; }
+    local port; port=$(rand_port)
+    printf "PORT='%s'\nTOKEN='%s'\n" "$port" "$(rand_hex 16)" >"$SUB_ENV"; chmod 600 "$SUB_ENV"
+    mkdir -p "$WWW"
+    svc_write onekey-sub "$httpd -f -p $port -h $WWW"
+    open_port "$port" tcp
+  fi
+  gen_clients
+  svc restart onekey-sub; sleep 1
+  [[ $(svc status onekey-sub) == active ]] || { red "订阅服务启动失败"; return 1; }
+  green "订阅已开启（地址里带随机密钥，不要公开）："
+  sub_urls
+  echo "小火箭：右上角 ＋ → 类型选 Subscribe → 粘贴「小火箭订阅」地址"
+  echo "Clash Verge：订阅 → 粘贴「Clash 订阅」地址 → 导入"
+}
+sub_reset() {
+  sub_on || { yellow "订阅未开启"; return; }
+  ( . "$SUB_ENV"; rm -rf "$WWW/$TOKEN"; printf "PORT='%s'\nTOKEN='%s'\n" "$PORT" "$(rand_hex 16)" >"$SUB_ENV" )
+  gen_clients; green "已更换订阅地址，旧地址立即失效："; sub_urls
+}
+sub_disable() {
+  sub_on || { yellow "订阅未开启"; return; }
+  svc_remove onekey-sub; rm -rf "$WWW" "$SUB_ENV"; green "订阅已关闭"
+}
+sub_menu() {
+  echo
+  echo "订阅链接（小火箭 / Clash 一键导入）："
+  echo "  1) 开启 / 查看订阅地址"
+  echo "  2) 更换订阅地址（旧地址失效）"
+  echo "  3) 关闭订阅"
+  echo "  4) 显示 Clash 配置内容"
+  echo "  0) 返回"
+  local c; read -r -p "请选择 [0-4]: " c
+  case $c in 1) sub_enable ;; 2) sub_reset ;; 3) sub_disable ;; 4) gen_clients; [[ -f $CLASH ]] && cat "$CLASH" || yellow "还没有可用节点" ;; esac
+}
+
+# ---------------- 删除 / 卸载 / 其它 ----------------
+remove_proto() {
+  local p=$1
+  has $p || { yellow "$(pretty $p) 未安装"; return; }
+  rm -f "$STATE/$p.env"
+  case $p in
+    snell) svc_remove onekey-snell; rm -f "$BASE/snell.conf" "$BIN_SNELL" ;;
+    argo)  svc_remove onekey-argo; rm -f "$ARGO_LOG" "$BIN_CF" ;;
+  esac
+  [[ $p != snell ]] && apply_core_of "$p"
+  gen_clients >/dev/null 2>&1
+  green "$(pretty $p) 已删除（订阅和 Clash 配置已同步更新）"
+}
+
+uninstall_all() {
+  if [[ $NONINT != 1 ]]; then
+    local a; read -r -p "确定卸载全部协议和程序？[y/N]: " a; [[ $a == [yY] ]] || return
+  fi
+  svc_remove onekey-xray; svc_remove onekey-sb; svc_remove onekey-snell; svc_remove onekey-argo; svc_remove onekey-sub
+  [[ -f /etc/sysctl.d/99-onekey-tcp.conf ]] && tcp_restore
+  rm -rf "$BASE" "$BIN_XRAY" "$BIN_SB" "$BIN_SNELL" "$BIN_CF" "$CMD" /etc/sysctl.d/99-onekey-bbr.conf
+  green "已全部卸载"
+}
+
+enable_bbr() {
+  if [[ $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) == bbr ]]; then green "BBR 已开启"; return; fi
+  printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' >/etc/sysctl.d/99-onekey-bbr.conf
+  sysctl -p /etc/sysctl.d/99-onekey-bbr.conf >/dev/null 2>&1
+  [[ $(sysctl -n net.ipv4.tcp_congestion_control) == bbr ]] && green "BBR 已开启" || red "BBR 开启失败（内核可能不支持）"
+}
+
+# ---------------- TCP 调优 ----------------
+TCP_CONF=/etc/sysctl.d/99-onekey-tcp.conf
+TCP_BAK=$BASE/sysctl-backup.conf
+TCP_KEYS=(net.core.default_qdisc net.ipv4.tcp_congestion_control
+  net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default
+  net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.udp_rmem_min net.ipv4.udp_wmem_min
+  net.core.netdev_max_backlog net.core.somaxconn net.ipv4.tcp_max_syn_backlog
+  net.ipv4.tcp_fastopen net.ipv4.tcp_mtu_probing net.ipv4.tcp_slow_start_after_idle
+  net.ipv4.tcp_notsent_lowat net.ipv4.tcp_fin_timeout net.ipv4.tcp_tw_reuse
+  net.ipv4.tcp_keepalive_time net.ipv4.tcp_keepalive_intvl net.ipv4.tcp_keepalive_probes
+  net.ipv4.tcp_max_tw_buckets fs.file-max)
+
+tcp_tune() {
+  local mem buf
+  mem=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+  if   (( mem <= 600 ));  then buf=8388608     # ≤512M 机器：8 MB
+  elif (( mem <= 1200 )); then buf=16777216    # 1G：16 MB
+  elif (( mem <= 4200 )); then buf=33554432    # 2-4G：32 MB
+  else buf=67108864; fi                        # 更大：64 MB
+  # 第一次调优前备份原始值，恢复默认时用
+  if [[ ! -f $TCP_BAK ]]; then
+    local k v; : >"$TCP_BAK"
+    for k in "${TCP_KEYS[@]}"; do v=$(sysctl -n "$k" 2>/dev/null) && echo "$k = $v" >>"$TCP_BAK"; done
+  fi
+  cat >"$TCP_CONF" <<EOF
+# OneKey TCP 调优（内存 ${mem}MB，缓冲区上限 $((buf/1048576))MB）
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = $buf
+net.core.wmem_max = $buf
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.ipv4.tcp_rmem = 4096 131072 $buf
+net.ipv4.tcp_wmem = 4096 65536 $buf
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+net.core.netdev_max_backlog = 16384
+net.core.somaxconn = 8192
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_max_tw_buckets = 65536
+fs.file-max = 1048576
+EOF
+  rm -f /etc/sysctl.d/99-onekey-bbr.conf
+  local out fail
+  out=$(sysctl -p "$TCP_CONF" 2>&1 >/dev/null); fail=$(echo "$out" | grep -c . )
+  [[ -z $out ]] && fail=0
+  green "TCP 调优已应用（内存 ${mem}MB → 缓冲区上限 $((buf/1048576))MB，BBR + fq）"
+  (( fail > 0 )) && { yellow "有 $fail 项当前内核不支持，已跳过："; echo "$out" | sed 's/^/  /'; }
+  yellow "已写入 $TCP_CONF，重启后依然生效；节点无需重启"
+}
+
+tcp_show() {
+  echo
+  local k
+  for k in net.ipv4.tcp_congestion_control net.core.default_qdisc net.core.rmem_max net.core.wmem_max \
+           net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_fastopen net.ipv4.tcp_mtu_probing \
+           net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_notsent_lowat net.core.somaxconn; do
+    printf '  %-38s %s\n' "$k" "$(sysctl -n "$k" 2>/dev/null)"
+  done
+  [[ -f $TCP_CONF ]] && green "  状态：已应用 OneKey 调优" || yellow "  状态：系统默认"
+  echo
+}
+
+tcp_restore() {
+  [[ -f $TCP_CONF ]] || { yellow "当前没有应用 OneKey 调优"; return; }
+  rm -f "$TCP_CONF"
+  if [[ -f $TCP_BAK ]]; then
+    sysctl -p "$TCP_BAK" >/dev/null 2>&1; rm -f "$TCP_BAK"
+    green "已恢复为调优前的系统参数"
+  else
+    yellow "没有找到备份，已删除调优配置，重启服务器后恢复系统默认"
+  fi
+}
+
+tcp_menu() {
+  echo
+  echo "TCP 调优："
+  echo "  1) 应用推荐调优（BBR + fq + 按内存调整缓冲区，对 Hysteria2/TUIC 的 UDP 也有帮助）"
+  echo "  2) 查看当前参数"
+  echo "  3) 恢复调优前的参数"
+  echo "  0) 返回"
+  local c; read -r -p "请选择 [0-3]: " c
+  case $c in 1) tcp_tune ;; 2) tcp_show ;; 3) tcp_restore ;; esac
+}
+
+status() {
+  echo
+  local s
+  for s in onekey-xray onekey-sb onekey-snell onekey-argo; do
+    { [[ -f /etc/systemd/system/$s.service ]] || [[ -f /etc/init.d/$s ]]; } || continue
+    if [[ $(svc status $s) == active ]]; then green "$s：运行中"; else red "$s：未运行"; fi
+  done
+  echo "已安装协议："
+  local p; for p in reality hy2 tuic anytls argo ss snell; do has $p && echo "  - $(pretty $p)  端口 $( . "$STATE/$p.env"; echo "$PORT")"; done
+  [[ -x $BIN_XRAY ]] && echo "Xray 版本：$($BIN_XRAY version | head -1 | awk '{print $2}')"
+  [[ -x $BIN_SB ]] && echo "sing-box 版本：$($BIN_SB version | head -1 | awk '{print $3}')"
+  echo "拥塞控制：$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+  echo
+}
+
+restart_all() {
+  ls "$STATE"/*.env >/dev/null 2>&1 || { yellow "还没有安装任何协议"; return; }
+  [[ -f $XRAY_CONF ]] && svc restart onekey-xray
+  [[ -f $SB_CONF ]] && svc restart onekey-sb
+  has snell && svc restart onekey-snell
+  has argo && { : >"$ARGO_LOG"; svc restart onekey-argo; }
+  has argo && argo_domain >/dev/null
+  gen_clients >/dev/null 2>&1
+  green "已重启"; has argo && yellow "临时隧道重启后域名会变化，订阅已自动更新；单独导入的 Argo 链接需重新复制"
+}
+
+self_install() {
+  [[ -x $CMD && $1 != force ]] && return
+  if [[ -f $0 && $0 != /dev/fd/* && $0 != /proc/* ]]; then install -m 755 "$0" "$CMD"
+  else curl -fsSL -o "$CMD" "$SCRIPT_URL" && chmod 755 "$CMD"; fi
+  [[ -x $CMD ]] && green "快捷命令已安装：以后输入 onekey 即可打开菜单"
+}
+
+# ---------------- 菜单 ----------------
+proto_menu() {
+  echo
+  echo "请选择协议："
+  echo
+  echo "  1) VLESS-REALITY"
+  echo "  2) Hysteria2"
+  echo "  3) TUIC"
+  echo "  4) AnyTLS"
+  echo "  5) VLESS-Argo"
+  echo "  6) Shadowsocks"
+  echo "  7) Snell v6"
+  echo "  0) 返回"
+  echo
+  local c; read -r -p "请选择 [0-7]: " c
+  case $c in
+    1) add_reality ;; 2) add_hy2 ;; 3) add_tuic ;; 4) add_anytls ;;
+    5) add_argo ;; 6) add_ss ;; 7) add_snell ;; *) return ;;
+  esac
+}
+pick_proto() {   # 让用户从已安装的协议里选一个
+  local arr=() p i=1
+  for p in reality hy2 tuic anytls argo ss snell; do has $p && arr+=("$p"); done
+  [[ ${#arr[@]} -eq 0 ]] && { yellow "还没有安装任何协议"; return 1; }
+  for p in "${arr[@]}"; do echo "  $i) $(pretty $p)"; i=$((i+1)); done
+  local c; read -r -p "请选择: " c
+  [[ $c =~ ^[0-9]+$ ]] && (( c>=1 && c<=${#arr[@]} )) || return 1
+  PICKED=${arr[$((c-1))]}
+}
+main_menu() {
+  while :; do
+    echo
+    blue "=========== OneKey 多协议节点脚本 v$ONEKEY_VER ==========="
+    echo "  1) 安装 / 添加协议"
+    echo "  2) 查看节点链接"
+    echo "  3) 订阅链接（小火箭 / Clash）"
+    echo "  4) 删除某个协议"
+    echo "  5) 重启所有服务"
+    echo "  6) 运行状态"
+    echo "  7) 开启 BBR 加速"
+    echo "  8) TCP 调优"
+    echo "  9) 更新内核（已安装的 Xray / sing-box）"
+    echo " 10) 卸载全部"
+    echo "  0) 退出"
+    echo
+    local c; read -r -p "请选择 [0-10]: " c
+    case $c in
+      1) proto_menu ;;
+      2) show_links ;;
+      3) sub_menu ;;
+      4) pick_proto && remove_proto "$PICKED" ;;
+      5) restart_all ;;
+      6) status ;;
+      7) enable_bbr ;;
+      8) tcp_menu ;;
+      9) update_cores ;;
+      10) uninstall_all; exit 0 ;;
+      0) exit 0 ;;
+    esac
+  done
+}
+
+# ---------------- 入口 ----------------
+usage() {
+  cat <<EOF
+用法：onekey                 打开菜单
+      onekey add <协议>      非交互安装（reality|hy2|tuic|anytls|argo|ss|snell）
+                             可用环境变量：PORT_SET= SNI= METHOD= MODE=
+      onekey links           查看全部链接
+      onekey remove <协议>   删除协议
+      onekey status          运行状态
+      onekey bbr             开启 BBR
+      onekey tcp [show|restore]  TCP 调优 / 查看 / 恢复
+      onekey sub [on|reset|off]  订阅链接（小火箭 / Clash）开启·查看 / 换地址 / 关闭
+      onekey clash           输出 Clash 配置
+      onekey rebuild         按当前规则重新生成内核配置（升级脚本后用）
+      onekey uninstall       卸载全部
+EOF
+}
+
+detect_os
+mkdir -p "$BASE" "$STATE"; chmod 700 "$BASE"
+case $1 in
+  "" ) install_deps; self_install; main_menu ;;
+  add) NONINT=1; install_deps; self_install
+       case $2 in reality|hy2|tuic|anytls|argo|ss|snell) "add_$2" ;; *) usage; exit 1 ;; esac ;;
+  links) NONINT=1 show_links ;;
+  remove) remove_proto "$2" ;;
+  status) status ;;
+  bbr) enable_bbr ;;
+  tcp) case $2 in show) tcp_show ;; restore) tcp_restore ;; *) tcp_tune ;; esac ;;
+  sub) case $2 in reset) sub_reset ;; off) sub_disable ;; *) sub_enable ;; esac ;;
+  clash) gen_clients >/dev/null 2>&1; [[ -f $CLASH ]] && cat "$CLASH" ;;
+  rebuild) rebuild ;;
+  uninstall) NONINT=1 uninstall_all ;;
+  -v|--version) echo "$ONEKEY_VER" ;;
+  *) usage ;;
+esac
