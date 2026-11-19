@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 用 onekey 生成的分享链接构造客户端，逐个测试连通性（在服务器上运行）
 #  - VLESS-REALITY：服务端是 Xray，用 Xray 客户端测（新版 Xray 的 REALITY 与 sing-box 客户端不兼容）
-#  - 其它协议：用 sing-box 客户端测
+#  - 其它协议：用 sing-box 客户端测（链接没写跳过证书验证时会真正校验证书）
 # 用法：bash test_links.sh [链接文件，默认 /etc/onekey/links.txt]
 set -o pipefail
 FILE=${1:-/etc/onekey/links.txt}
@@ -12,6 +12,9 @@ HAS_XRAY=0; command -v xray >/dev/null 2>&1 && HAS_XRAY=1
 
 urldec() { local s=${1//+/ }; printf '%b' "${s//%/\\x}"; }
 qp() { echo "$QUERY" | tr '&' '\n' | grep -m1 "^$1=" | cut -d= -f2- | { read -r v; urldec "$v"; }; }
+insec() {   # 链接里写了跳过证书验证才跳过；否则正常校验证书
+  [[ $(qp insecure) == 1 || $(qp allow_insecure) == 1 || $(qp allowInsecure) == 1 ]] && echo true || echo false
+}
 b64d() { local s=$1; s=${s//-/+}; s=${s//_/\/}; while (( ${#s} % 4 )); do s+="="; done; echo "$s" | base64 -d 2>/dev/null; }
 
 parse() {   # 拆出 SCHEME USERINFO HOST PORT QUERY TAG
@@ -46,15 +49,15 @@ sb_outbound() {   # 其它链接 -> sing-box outbound
             transport:{type:"ws",path:$path,headers:{Host:$host}}}'
       fi ;;
     hysteria2)
-      jq -nc --arg t "$TAG" --arg h "$HOST" --argjson p "$PORT" --arg pw "$(urldec "$USERINFO")" --arg sni "$(qp sni)" \
-        '{type:"hysteria2",tag:$t,server:$h,server_port:$p,password:$pw,tls:{enabled:true,server_name:$sni,insecure:true,alpn:["h3"]}}' ;;
+      jq -nc --arg t "$TAG" --arg h "$HOST" --argjson p "$PORT" --arg pw "$(urldec "$USERINFO")" --arg sni "$(qp sni)" --argjson ins "$(insec)" \
+        '{type:"hysteria2",tag:$t,server:$h,server_port:$p,password:$pw,tls:{enabled:true,server_name:$sni,insecure:$ins,alpn:["h3"]}}' ;;
     tuic)
       jq -nc --arg t "$TAG" --arg h "$HOST" --argjson p "$PORT" --arg u "${USERINFO%%:*}" --arg pw "$(urldec "${USERINFO#*:}")" \
-        --arg sni "$(qp sni)" --arg cc "$(qp congestion_control)" \
-        '{type:"tuic",tag:$t,server:$h,server_port:$p,uuid:$u,password:$pw,congestion_control:$cc,tls:{enabled:true,server_name:$sni,insecure:true,alpn:["h3"]}}' ;;
+        --arg sni "$(qp sni)" --arg cc "$(qp congestion_control)" --argjson ins "$(insec)" \
+        '{type:"tuic",tag:$t,server:$h,server_port:$p,uuid:$u,password:$pw,congestion_control:$cc,tls:{enabled:true,server_name:$sni,insecure:$ins,alpn:["h3"]}}' ;;
     anytls)
-      jq -nc --arg t "$TAG" --arg h "$HOST" --argjson p "$PORT" --arg pw "$(urldec "$USERINFO")" --arg sni "$(qp sni)" \
-        '{type:"anytls",tag:$t,server:$h,server_port:$p,password:$pw,tls:{enabled:true,server_name:$sni,insecure:true}}' ;;
+      jq -nc --arg t "$TAG" --arg h "$HOST" --argjson p "$PORT" --arg pw "$(urldec "$USERINFO")" --arg sni "$(qp sni)" --argjson ins "$(insec)" \
+        '{type:"anytls",tag:$t,server:$h,server_port:$p,password:$pw,tls:{enabled:true,server_name:$sni,insecure:$ins}}' ;;
     ss)
       local mp; mp=$(b64d "$USERINFO")
       jq -nc --arg t "$TAG" --arg h "$HOST" --argjson p "$PORT" --arg m "${mp%%:*}" --arg pw "${mp#*:}" \

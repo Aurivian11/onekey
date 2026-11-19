@@ -5,11 +5,12 @@
 #        Shadowsocks / Snell v6
 #  内核：Xray（REALITY / Hysteria2 / Argo / SS）+ sing-box（TUIC / AnyTLS）
 #        + snell-server + cloudflared；内核只在选择协议时才安装
+#  证书：域名证书 / IP 证书（默认，Let's Encrypt 自动续签）/ 自签
 #  系统：Debian / Ubuntu / Alpine（OpenRC）/ CentOS 系
 # =============================================================
 set -o pipefail
 
-ONEKEY_VER="1.0.0"
+ONEKEY_VER="1.1.0"
 # 一键安装时脚本会从这里下载自己，安装成 onekey 命令
 SCRIPT_URL="${ONEKEY_URL:-https://raw.githubusercontent.com/Aurivian11/onekey/main/install.sh}"
 
@@ -341,11 +342,221 @@ need_core() {   # 给某个协议装好它需要的内核（第一次安装时�
   esac
 }
 
-gen_cert() {
-  [[ -f $CERT_DIR/cert.pem ]] && return
+# ---------------- 证书（只给 Hysteria2 / TUIC / AnyTLS 用） ----------------
+# CERT_MODE：domain = 域名证书    ip = IP 证书（Let's Encrypt 短期证书，约 6 天，acme.sh 自动续签）
+#            self   = 自签证书
+# 三种证书都放在 $CERT_DIR/cert.pem + key.pem，内核配置不用改；只有链接里的 SNI / 跳过验证不同
+CERT_ENV=$BASE/cert.env
+ACME_HOME=/root/.acme.sh
+ACME=$ACME_HOME/acme.sh
+ACME_LOG=$BASE/acme.log
+CERT_MODE=""; CERT_DOMAIN=""; CERT_NAMES=""
+[[ -f $CERT_ENV ]] && . "$CERT_ENV"
+[[ -z $CERT_MODE && -f $CERT_DIR/cert.pem ]] && CERT_MODE=self   # 1.0 版装的都是自签
+save_cert_env() {
+  mkdir -p "$BASE"
+  printf "CERT_MODE='%s'\nCERT_DOMAIN='%s'\nCERT_NAMES='%s'\n" "$CERT_MODE" "$CERT_DOMAIN" "$CERT_NAMES" >"$CERT_ENV"; chmod 600 "$CERT_ENV"
+}
+cert_label() {
+  case $CERT_MODE in
+    domain) echo "域名证书（$CERT_DOMAIN）" ;;
+    ip)     echo "IP 证书（${CERT_NAMES// / + }，自动续签）" ;;
+    self)   echo "自签证书" ;;
+    *)      echo "未设置" ;;
+  esac
+}
+cert_expiry() {
+  [[ -s $CERT_DIR/cert.pem ]] || return
+  local e; e=$(openssl x509 -enddate -noout -in "$CERT_DIR/cert.pem" | cut -d= -f2)
+  date -d "$e" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$e"
+}
+uses_cert() { has hy2 || has tuic || has anytls; }
+cert_main() { echo "${CERT_NAMES%% *}"; }   # acme.sh 里记录这张证书用的名字
+tls_opts() {   # tls_opts 主机 -> "SNI 跳过验证(1/0)"
+  case $CERT_MODE in
+    domain) echo "$CERT_DOMAIN 0" ;;
+    ip) if [[ " $CERT_NAMES " == *" $1 "* ]]; then echo "$1 0"; else echo "$1 1"; fi ;;   # 证书没包含这个 IP 时只能跳过验证
+    *)  echo "$DEF_TLS_SNI 1" ;;
+  esac
+}
+
+cert_reload() {   # 证书换了以后重启用到证书的内核（acme.sh 续签后自动调用 onekey cert reload）
+  has hy2 && [[ -f $XRAY_CONF ]] && svc restart onekey-xray
+  { has tuic || has anytls; } && [[ -f $SB_CONF ]] && svc restart onekey-sb
+  return 0
+}
+
+acme_install() {
+  [[ -x $ACME ]] && return
+  yellow "安装 acme.sh（申请证书 + 每天检查自动续签）..."
+  case $PKG in
+    apt) DEBIAN_FRONTEND=noninteractive apt-get install -y -qq socat cron >/dev/null 2>&1 \
+           || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq socat cron >/dev/null; }
+         systemctl enable --now cron >/dev/null 2>&1 ;;
+    apk) apk add --no-cache socat >/dev/null; rc-update add crond default >/dev/null 2>&1; rc-service crond start >/dev/null 2>&1 ;;
+    dnf|yum) $PKG install -y -q socat cronie >/dev/null; systemctl enable --now crond >/dev/null 2>&1 ;;
+  esac
+  command -v socat >/dev/null 2>&1 || { red "socat 安装失败"; return 1; }
+  ( cd /tmp && curl -fsSL https://get.acme.sh | sh ) >"$ACME_LOG" 2>&1
+  [[ -x $ACME ]] || { red "acme.sh 安装失败（日志：$ACME_LOG）"; return 1; }
+  $ACME --upgrade --auto-upgrade >/dev/null 2>&1
+}
+
+acme_forget() {   # acme_forget 名字：不再续签这张证书
+  [[ -x $ACME && -n $1 ]] || return 0
+  $ACME --remove -d "$1" --ecc >/dev/null 2>&1; $ACME --remove -d "$1" >/dev/null 2>&1
+  rm -rf "${ACME_HOME:?}/$1" "${ACME_HOME:?}/$1_ecc"
+}
+
+acme_issue() {   # acme_issue ip|domain 名字... -> 申请成功后装到 $CERT_DIR
+  local kind=$1; shift
+  local args=() n
+  for n in "$@"; do args+=(-d "$n"); done
+  if ss -Hltn 'sport = :80' 2>/dev/null | grep -q .; then
+    red "80 端口已被占用：$(ss -Hltnp 'sport = :80' 2>/dev/null | grep -o 'users:(("[^"]*' | head -1 | cut -d'"' -f2)"
+    yellow "申请和续签证书时 Let's Encrypt 要访问本机 80 端口，请先停掉占用 80 端口的程序"
+    return 1
+  fi
+  open_port 80 tcp
+  local extra=()
+  [[ $kind == ip ]] && extra=(--certificate-profile shortlived --days 3)   # IP 证书约 6 天有效，3 天续签一次
+  yellow "向 Let's Encrypt 申请证书：$*（要用 80 端口验证，约半分钟）..."
+  if ! $ACME --issue "${args[@]}" --standalone --httpport 80 --server letsencrypt --keylength ec-256 --force "${extra[@]}" >>"$ACME_LOG" 2>&1; then
+    acme_forget "$1"; return 1
+  fi
+  mkdir -p "$CERT_DIR"
+  # 先装到临时位置确认成功，再替换正在用的证书
+  local td; td=$(mktemp -d)
+  $ACME --install-cert -d "$1" --ecc --key-file "$td/key.pem" --fullchain-file "$td/cert.pem" >>"$ACME_LOG" 2>&1
+  if [[ ! -s $td/cert.pem || ! -s $td/key.pem ]]; then rm -rf "$td"; acme_forget "$1"; return 1; fi
+  install -m 644 "$td/cert.pem" "$CERT_DIR/cert.pem"; install -m 600 "$td/key.pem" "$CERT_DIR/key.pem"; rm -rf "$td"
+  # 以后续签直接装到正式位置，并重启内核
+  $ACME --install-cert -d "$1" --ecc --key-file "$CERT_DIR/key.pem" --fullchain-file "$CERT_DIR/cert.pem" \
+    --reloadcmd "$CMD cert reload" >>"$ACME_LOG" 2>&1
+  return 0
+}
+
+cert_ip() {   # IP 证书：按「IP 设置」申请；IPv4+IPv6 一起申请失败时，再分别单独试
+  acme_install || return 1
+  [[ -z $IP4$IP6 ]] && get_ip
+  local tries=() t
+  case $LINK_IP in
+    4) tries=("${IP4:-$IP6}") ;;
+    6) tries=("${IP6:-$IP4}") ;;
+    *) if [[ -n $IP4 && -n $IP6 ]]; then tries=("$IP4 $IP6" "$IP4" "$IP6"); else tries=("$IP4$IP6"); fi ;;
+  esac
+  for t in "${tries[@]}"; do
+    # shellcheck disable=SC2086
+    if acme_issue ip $t; then
+      CERT_NAMES=$t; CERT_DOMAIN=""
+      [[ $t != "${tries[0]}" ]] && yellow "「${tries[0]// / + }」没有全部验证通过，证书只包含 $t（其它 IP 的链接会跳过证书验证）"
+      return 0
+    fi
+  done
+  red "IP 证书申请失败：请确认 80 端口（TCP）能从外网访问，没有被服务商防火墙拦截（日志：$ACME_LOG）"
+  return 1
+}
+
+dns_lookup() {   # dns_lookup 域名 A|AAAA -> 解析结果（用公共 DNS，避免本机 hosts 干扰）
+  curl -fsS --max-time 8 -H 'accept: application/dns-json' "https://dns.google/resolve?name=$1&type=$2" 2>/dev/null \
+    | jq -r --arg t "$([[ $2 == A ]] && echo 1 || echo 28)" '.Answer[]? | select(.type == ($t|tonumber)) | .data'
+}
+cert_domain() {   # 域名证书：域名必须已解析到本机
+  local d=${1,,}
+  [[ $d =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]] || { red "域名格式不对：$1"; return 1; }
+  [[ -z $IP4$IP6 ]] && get_ip
+  local a aaaa hit=0
+  a=$(dns_lookup "$d" A); aaaa=$(dns_lookup "$d" AAAA)
+  [[ -n $IP4 ]] && grep -qxF "$IP4" <<<"$a" && hit=1
+  [[ -n $IP6 ]] && grep -qxF "$IP6" <<<"$aaaa" && hit=1
+  if [[ $hit == 0 ]]; then
+    red "域名 $d 没有解析到本机（A：$(echo $a)  AAAA：$(echo $aaaa)；本机：$IP4 $IP6）"
+    yellow "先在域名的 DNS 里添加 A 记录指向 $IP4${IP6:+（或 AAAA 指向 $IP6）}；用 Cloudflare 的要关掉小黄云（仅 DNS），等几分钟再试"
+    return 1
+  fi
+  [[ -n $aaaa && -z $IP6 ]] && yellow "提示：域名有 AAAA 记录但本机没有 IPv6，Let's Encrypt 可能优先走 IPv6 导致验证失败"
+  acme_install || return 1
+  acme_issue domain "$d" || { red "域名证书申请失败：请确认 80 端口（TCP）能从外网访问（日志：$ACME_LOG）"; return 1; }
+  CERT_DOMAIN=$d; CERT_NAMES=$d
+}
+
+cert_self() {
   mkdir -p "$CERT_DIR"
   openssl ecparam -genkey -name prime256v1 -out "$CERT_DIR/key.pem" 2>/dev/null
   openssl req -new -x509 -days 3650 -key "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" -subj "/CN=$DEF_TLS_SNI" 2>/dev/null
+  chmod 600 "$CERT_DIR/key.pem"
+  CERT_DOMAIN=""; CERT_NAMES=""
+}
+
+set_cert() {   # set_cert ip|domain|self [域名]：申请 / 生成证书并记录；失败时原来的证书不动
+  local mode=$1 d=$2 old_mode=$CERT_MODE old_main; old_main=$(cert_main)
+  if [[ $mode == domain && -z $d ]]; then
+    [[ $NONINT == 1 ]] && { red "域名证书需要 DOMAIN=你的域名"; return 1; }
+    read -r -p "输入已解析到本机的域名：" d
+    [[ -n $d ]] || return 1
+  fi
+  case $mode in
+    ip)     cert_ip || return 1 ;;
+    domain) cert_domain "$d" || return 1 ;;
+    self)   cert_self ;;
+    *)      red "未知证书类型：$mode"; return 1 ;;
+  esac
+  CERT_MODE=$mode; save_cert_env
+  [[ ($old_mode == ip || $old_mode == domain) && -n $old_main && $old_main != "$(cert_main)" ]] && acme_forget "$old_main"
+  green "证书：$(cert_label)$( [[ $mode != self ]] && echo "，到期 $(cert_expiry)")"
+}
+
+gen_cert() {   # 第一次装 Hysteria2 / TUIC / AnyTLS 时选择证书（环境变量 CERT=ip|domain|self、DOMAIN= 可跳过询问）
+  [[ -n $CERT_MODE && -s $CERT_DIR/cert.pem ]] && return
+  local m=${CERT:-}
+  if [[ -z $m && $NONINT != 1 ]]; then
+    echo
+    echo "Hysteria2 / TUIC / AnyTLS 需要 TLS 证书，选择证书类型（以后可在主菜单「证书设置」修改）："
+    echo "  1) 域名证书   最不容易被识别，需要一个已解析到本机的域名"
+    echo "  2) IP 证书    Let's Encrypt 签发，不需要域名，自动续签（需要 80 端口能从外网访问）"
+    echo "  3) 自签证书   什么都不需要，但容易被识别，客户端要跳过证书验证"
+    case $(ask "请选择" 2) in 1) m=domain;; 3) m=self;; *) m=ip;; esac
+  fi
+  if ! set_cert "${m:-ip}" "${DOMAIN:-}"; then
+    yellow "先改用自签证书，节点照常可用；以后可在主菜单「证书设置」重新申请"
+    set_cert self
+  fi
+}
+
+cert_apply() {   # 换证书后：重启内核，更新链接 / Clash / 订阅
+  cert_reload
+  if uses_cert; then
+    gen_clients >/dev/null 2>&1
+    yellow "Hysteria2 / TUIC / AnyTLS 的链接已更新（SNI / 证书验证变了），客户端需重新导入或更新订阅"
+  fi
+}
+cert_renew() {
+  case $CERT_MODE in
+    ip|domain)
+      [[ -x $ACME ]] || { red "找不到 acme.sh"; return 1; }
+      yellow "续签中..."
+      if $ACME --renew -d "$(cert_main)" --ecc --force >>"$ACME_LOG" 2>&1; then green "已续签，到期 $(cert_expiry)"
+      else red "续签失败（日志：$ACME_LOG）"; return 1; fi ;;
+    *) yellow "当前是自签证书，不需要续签" ;;
+  esac
+}
+cert_menu() {
+  echo
+  echo "当前证书：$(cert_label)$( [[ -s $CERT_DIR/cert.pem ]] && echo "    到期：$(cert_expiry)")"
+  echo "（证书只给 Hysteria2 / TUIC / AnyTLS 用；REALITY、Argo、SS、Snell 不需要证书）"
+  echo
+  echo "  1) 域名证书   最不容易被识别，需要已解析到本机的域名"
+  echo "  2) IP 证书    Let's Encrypt，自动续签（推荐，需要 80 端口）"
+  echo "  3) 自签证书   容易被识别"
+  echo "  4) 立即续签"
+  echo "  0) 返回"
+  local c; read -r -p "请选择 [0-4]: " c
+  case $c in
+    1) set_cert domain && cert_apply ;;
+    2) set_cert ip && cert_apply ;;
+    3) set_cert self && cert_apply ;;
+    4) cert_renew ;;
+  esac
 }
 
 # 不依赖内核的密钥生成
@@ -583,11 +794,13 @@ link_for() {   # link_for 协议 主机 -> 链接
   [[ $h == *:* ]] && hb="[$h]"
   ( . "$STATE/$p.env"
   local tag; tag=$(uri "$NAME_PREFIX-$p$( [[ $h == *:* ]] && echo -v6)")
+  local sni ins ti="" tt=""; read -r sni ins <<<"$(tls_opts "$h")"; sni=$(uri "$sni")
+  [[ $ins == 1 ]] && { ti="&insecure=1&allowInsecure=1"; tt="&allow_insecure=1&allowInsecure=1"; }
   case $p in
     reality) echo "vless://$UUID@$hb:$PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$SNI&fp=chrome&pbk=$PUB&sid=$SID&type=tcp&headerType=none#$tag" ;;
-    hy2)     echo "hysteria2://$PASS@$hb:$PORT?sni=$DEF_TLS_SNI&alpn=h3&insecure=1&allowInsecure=1#$tag" ;;
-    tuic)    echo "tuic://$UUID:$PASS@$hb:$PORT?sni=$DEF_TLS_SNI&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1&allowInsecure=1#$tag" ;;
-    anytls)  echo "anytls://$PASS@$hb:$PORT?sni=$DEF_TLS_SNI&insecure=1&allowInsecure=1#$tag" ;;
+    hy2)     echo "hysteria2://$PASS@$hb:$PORT?sni=$sni&alpn=h3$ti#$tag" ;;
+    tuic)    echo "tuic://$UUID:$PASS@$hb:$PORT?sni=$sni&alpn=h3&congestion_control=bbr&udp_relay_mode=native$tt#$tag" ;;
+    anytls)  echo "anytls://$PASS@$hb:$PORT?sni=$sni$ti#$tag" ;;
     ss)      echo "ss://$(b64url "$METHOD:$PASS")@$hb:$PORT#$tag" ;;
     snell)   echo "$NAME_PREFIX-snell$( [[ $h == *:* ]] && echo -v6) = snell, $h, $PORT, psk=$PSK, version=6, reuse=true$( [[ $MODE != default ]] && echo ", mode=$MODE")" ;;
   esac )
@@ -615,7 +828,12 @@ show_links() {   # show_links [协议]  不带参数 = 全部
     elif [[ $NONINT != 1 ]] && command -v qrencode >/dev/null; then
       qrencode -t ANSIUTF8 "$(link_for $p "$(link_hosts | awk '{print $1}')")"
     fi
-    case $p in hy2|tuic|anytls) yellow "提示：使用自签证书，客户端需开启「跳过证书验证 / allowInsecure」";; esac
+    case $p in hy2|tuic|anytls)
+      case $CERT_MODE in
+        self) yellow "提示：使用自签证书，客户端需开启「跳过证书验证 / allowInsecure」（主菜单「证书设置」可换成 IP / 域名证书）" ;;
+        *)    echo "证书：$(cert_label)，客户端正常验证证书，不用开跳过验证" ;;
+      esac ;;
+    esac
   done
   gen_clients
   echo
@@ -641,11 +859,13 @@ sub_on() { [[ -f $SUB_ENV ]]; }
 clash_proxy() {   # clash_proxy 协议 主机 名称 -> 一行 YAML
   local p=$1 h=$2 n=$3
   ( . "$STATE/$p.env"
+  local sni ins scv; read -r sni ins <<<"$(tls_opts "$h")"
+  [[ $ins == 1 ]] && scv=true || scv=false
   case $p in
     reality) echo "  - {name: \"$n\", type: vless, server: \"$h\", port: $PORT, uuid: \"$UUID\", network: tcp, udp: true, tls: true, flow: xtls-rprx-vision, servername: \"$SNI\", client-fingerprint: chrome, reality-opts: {public-key: \"$PUB\", short-id: \"$SID\"}}" ;;
-    hy2)     echo "  - {name: \"$n\", type: hysteria2, server: \"$h\", port: $PORT, password: \"$PASS\", sni: \"$DEF_TLS_SNI\", skip-cert-verify: true, alpn: [h3]}" ;;
-    tuic)    echo "  - {name: \"$n\", type: tuic, server: \"$h\", port: $PORT, uuid: \"$UUID\", password: \"$PASS\", sni: \"$DEF_TLS_SNI\", skip-cert-verify: true, alpn: [h3], congestion-controller: bbr, udp-relay-mode: native}" ;;
-    anytls)  echo "  - {name: \"$n\", type: anytls, server: \"$h\", port: $PORT, password: \"$PASS\", sni: \"$DEF_TLS_SNI\", skip-cert-verify: true, client-fingerprint: chrome, udp: true}" ;;
+    hy2)     echo "  - {name: \"$n\", type: hysteria2, server: \"$h\", port: $PORT, password: \"$PASS\", sni: \"$sni\", skip-cert-verify: $scv, alpn: [h3]}" ;;
+    tuic)    echo "  - {name: \"$n\", type: tuic, server: \"$h\", port: $PORT, uuid: \"$UUID\", password: \"$PASS\", sni: \"$sni\", skip-cert-verify: $scv, alpn: [h3], congestion-controller: bbr, udp-relay-mode: native}" ;;
+    anytls)  echo "  - {name: \"$n\", type: anytls, server: \"$h\", port: $PORT, password: \"$PASS\", sni: \"$sni\", skip-cert-verify: $scv, client-fingerprint: chrome, udp: true}" ;;
     ss)      echo "  - {name: \"$n\", type: ss, server: \"$h\", port: $PORT, cipher: $METHOD, password: \"$PASS\", udp: true}" ;;
     argo)    echo "  - {name: \"$n\", type: vless, server: \"$h\", port: 443, uuid: \"$UUID\", udp: true, tls: true, servername: \"$h\", client-fingerprint: chrome, network: ws, ws-opts: {path: \"$WSPATH\", headers: {Host: \"$h\"}}}" ;;
   esac )
@@ -818,6 +1038,7 @@ uninstall_all() {
   fi
   svc_remove onekey-xray; svc_remove onekey-sb; svc_remove onekey-snell; svc_remove onekey-argo; svc_remove onekey-sub
   [[ -f /etc/sysctl.d/99-onekey-tcp.conf ]] && tcp_restore
+  [[ $CERT_MODE == ip || $CERT_MODE == domain ]] && acme_forget "$(cert_main)"   # acme.sh 本身保留（别的程序可能也在用）
   rm -rf "$BASE" "$BIN_XRAY" "$BIN_SB" "$BIN_SNELL" "$BIN_CF" "$CMD" /etc/sysctl.d/99-onekey-bbr.conf
   green "已全部卸载"
 }
@@ -936,6 +1157,7 @@ status() {
   [[ -x $BIN_SB ]] && echo "sing-box 版本：$($BIN_SB version | head -1 | awk '{print $3}')"
   echo "拥塞控制：$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
   echo "IP 设置：节点地址 $(link_label)，出站 $(out_label)"
+  [[ -n $CERT_MODE ]] && echo "证书：$(cert_label)$( [[ $CERT_MODE != self ]] && echo "，到期 $(cert_expiry)")"
   echo
 }
 
@@ -1000,10 +1222,11 @@ main_menu() {
     echo "  8) 开启 BBR 加速"
     echo "  9) TCP 调优"
     echo " 10) 更新内核（已安装的 Xray / sing-box）"
-    echo " 11) 卸载全部"
+    echo " 11) 证书设置（域名 / IP / 自签）"
+    echo " 12) 卸载全部"
     echo "  0) 退出"
     echo
-    local c; read -r -p "请选择 [0-11]: " c
+    local c; read -r -p "请选择 [0-12]: " c
     case $c in
       1) proto_menu ;;
       2) show_links ;;
@@ -1015,7 +1238,8 @@ main_menu() {
       8) enable_bbr ;;
       9) tcp_menu ;;
       10) update_cores ;;
-      11) uninstall_all; exit 0 ;;
+      11) cert_menu ;;
+      12) uninstall_all; exit 0 ;;
       0) exit 0 ;;
     esac
   done
@@ -1027,6 +1251,7 @@ usage() {
 用法：onekey                 打开菜单
       onekey add <协议>      非交互安装（reality|hy2|tuic|anytls|argo|ss|snell）
                              可用环境变量：PORT_SET= SNI= METHOD= MODE= IP_MODE=4|6|both
+                             CERT=ip|domain|self DOMAIN=（证书，默认 ip）
       onekey links           查看全部链接
       onekey remove <协议>   删除协议
       onekey status          运行状态
@@ -1037,6 +1262,11 @@ usage() {
       onekey rebuild         按当前规则重新生成内核配置（升级脚本后用）
       onekey ip [both|4|6]   节点链接用 IPv4+IPv6 / 只用 IPv4 / 只用 IPv6
       onekey ip out <auto|prefer4|prefer6|only4|only6>  出站 IP 优先级
+      onekey cert            查看证书（Hysteria2 / TUIC / AnyTLS 用）
+      onekey cert ip         换成 IP 证书（Let's Encrypt，自动续签）
+      onekey cert domain <域名>  换成域名证书
+      onekey cert self       换成自签证书
+      onekey cert renew      立即续签
       onekey uninstall       卸载全部
 EOF
 }
@@ -1056,6 +1286,13 @@ case $1 in
   clash) gen_clients >/dev/null 2>&1; [[ -f $CLASH ]] && cat "$CLASH" ;;
   rebuild) rebuild ;;
   ip) case $2 in both|4|6) set_link_ip "$2" ;; out) set_out_ip "${3:-auto}" ;; *) get_ip; echo "节点地址：$(link_label)    出站：$(out_label)    （IPv4 ${IP4:-无}  IPv6 ${IP6:-无}）" ;; esac ;;
+  cert) case $2 in
+          ip|self) set_cert "$2" && cert_apply ;;
+          domain)  set_cert domain "$3" && cert_apply ;;
+          renew)   cert_renew ;;
+          reload)  cert_reload ;;   # acme.sh 续签后调用
+          *) echo "证书：$(cert_label)$( [[ -s $CERT_DIR/cert.pem ]] && echo "    到期：$(cert_expiry)")" ;;
+        esac ;;
   uninstall) NONINT=1 uninstall_all ;;
   -v|--version) echo "$ONEKEY_VER" ;;
   *) usage ;;
