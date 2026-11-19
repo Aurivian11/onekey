@@ -40,7 +40,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Aurivian11/onekey/main/install
 | VLESS-REALITY | Xray | TCP | Vision 流控，伪装 `www.amd.com`，免域名免证书 |
 | Hysteria2 | Xray | UDP | 默认 IP 证书，见下方「证书」；可开端口跳跃 |
 | VLESS-Argo | Xray + cloudflared | 不开端口 | 走 Cloudflare 隧道隐藏服务器 IP；支持临时隧道或固定隧道（Token + 自己的域名） |
-| Shadowsocks | Xray | TCP+UDP | aes-256-gcm / chacha20-ietf-poly1305 / 2022-blake3，适合当中转落地 |
+| Shadowsocks | Xray | TCP+UDP | 默认 2022-blake3-aes-128-gcm，也可选 aes-256-gcm / chacha20-ietf-poly1305；适合当中转落地（安装时会显示明文参数） |
 | TUIC v5 | sing-box | UDP | Xray 不支持；BBR 拥塞控制；默认 IP 证书 |
 | AnyTLS | sing-box | TCP | Xray 不支持；默认 IP 证书 |
 | Snell v6 | 官方 snell-server | TCP | 仅 Surge 等支持 Snell v6 的客户端 |
@@ -157,7 +157,7 @@ onekey xray v26.3.27        # 换成指定版本
 onekey                      # 打开菜单
 onekey add reality          # 非交互安装：reality | hy2 | tuic | anytls | argo | ss | snell
 PORT_SET=443 onekey add reality
-METHOD=chacha20-ietf-poly1305 onekey add ss
+METHOD=aes-256-gcm onekey add ss
 SNI=www.microsoft.com onekey add reality
 IP_MODE=6 onekey add hy2        # 第一次安装时直接指定只用 IPv6（4 | 6 | both）
 CERT=self onekey add tuic       # 第一次装 Hysteria2 / TUIC / AnyTLS 时指定证书（ip 默认 | domain | self）

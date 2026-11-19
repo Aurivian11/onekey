@@ -10,7 +10,7 @@
 # =============================================================
 set -o pipefail
 
-ONEKEY_VER="1.3.3"
+ONEKEY_VER="1.3.4"
 # 一键安装时脚本会从这里下载自己，安装成 onekey 命令
 SCRIPT_URL="${ONEKEY_URL:-https://raw.githubusercontent.com/Aurivian11/onekey/main/install.sh}"
 
@@ -1017,13 +1017,13 @@ add_ss() {
   confirm_overwrite ss Shadowsocks || return
   need_core ss; ask_port "Shadowsocks" ss
   local m pw
-  if [[ $NONINT == 1 ]]; then m=${METHOD:-aes-256-gcm}
+  if [[ $NONINT == 1 ]]; then m=${METHOD:-2022-blake3-aes-128-gcm}
   else
     echo "加密方式："
-    echo "  1) aes-256-gcm（默认，3x-ui 落地常用）"
-    echo "  2) chacha20-ietf-poly1305"
-    echo "  3) 2022-blake3-aes-128-gcm"
-    case $(ask "请选择" 1) in 2) m=chacha20-ietf-poly1305 ;; 3) m=2022-blake3-aes-128-gcm ;; *) m=aes-256-gcm ;; esac
+    echo "  1) 2022-blake3-aes-128-gcm（默认，推荐；3x-ui、relay、小火箭、Clash Meta 都支持）"
+    echo "  2) aes-256-gcm（旧版 SS，Xray 已标为不推荐，只在对方不支持 2022 时用）"
+    echo "  3) chacha20-ietf-poly1305（旧版 SS）"
+    case $(ask "请选择" 1) in 2) m=aes-256-gcm ;; 3) m=chacha20-ietf-poly1305 ;; *) m=2022-blake3-aes-128-gcm ;; esac
   fi
   if [[ $m == 2022-* ]]; then pw=$(openssl rand -base64 16); else pw=$(rand_pw 24); fi
   save_state ss PORT="$PORT" METHOD="$m" PASS="$pw"
