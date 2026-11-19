@@ -10,7 +10,7 @@
 # =============================================================
 set -o pipefail
 
-ONEKEY_VER="1.3.4"
+ONEKEY_VER="1.3.5"
 # 一键安装时脚本会从这里下载自己，安装成 onekey 命令
 SCRIPT_URL="${ONEKEY_URL:-https://raw.githubusercontent.com/Aurivian11/onekey/main/install.sh}"
 
@@ -1127,7 +1127,12 @@ ss_params() {   # SS 的明文参数：当中转落地时在 3x-ui 出站 / 其�
     echo "  加密：$METHOD"
     echo "  密码：$PASS"
     echo "  传输：TCP + UDP" )
+  # 用 relay 脚本做中转时，复制这一行到中转机上运行即可（没装 relay 的话会先自动安装）
+  local l; l=$(link_for ss "$(link_hosts | awk '{print $1}')")
+  echo "在中转机上一键加线路（relay 中转脚本，github.com/Aurivian11/relay）："
+  echo "  command -v relay >/dev/null || bash <(curl -Ls $RELAY_URL) </dev/null; LAND='$l' relay add"
 }
+RELAY_URL=https://raw.githubusercontent.com/Aurivian11/relay/main/relay.sh
 show_links() {   # show_links [协议]  不带参数 = 全部
   [[ -z $IP4$IP6 ]] && get_ip
   local p list=("$@") l

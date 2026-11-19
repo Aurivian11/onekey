@@ -64,6 +64,17 @@ bash <(curl -Ls https://raw.githubusercontent.com/Aurivian11/onekey/main/install
 
 > **REALITY 兼容性（2026-11 实测）**：Xray 从 v26.7.11 起，REALITY 服务端与 sing-box 内核、mihomo（Clash Meta）内核的客户端不兼容，Xray 内核客户端（如 v2rayN）可正常连接；其它协议不受影响。脚本默认装**兼容版 v26.6.27**，Xray / sing-box / mihomo 内核客户端都能连，见下方「Xray 版本」。
 
+## 当中转落地（配合 relay）
+
+装 Shadowsocks 时除了链接，还会显示明文参数（地址 / 端口 / 加密 / 密码，3x-ui 出站手动填用），以及一行给中转机用的命令：
+
+```
+在中转机上一键加线路（relay 中转脚本，github.com/Aurivian11/relay）：
+  command -v relay >/dev/null || bash <(curl -Ls https://raw.githubusercontent.com/Aurivian11/relay/main/relay.sh) </dev/null; LAND='ss://...' relay add
+```
+
+复制到中转机运行，就生成一条「我 → 中转机 → 这台落地」的 VLESS-REALITY 线路。两层中转、备用落地自动切换、订阅等见 [relay](https://github.com/Aurivian11/relay)。
+
 ## IP 设置（IPv4 / IPv6）
 
 菜单 **4**，两项可分别设置：
