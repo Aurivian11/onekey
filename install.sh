@@ -10,7 +10,7 @@
 # =============================================================
 set -o pipefail
 
-ONEKEY_VER="1.3.2"
+ONEKEY_VER="1.3.3"
 # 一键安装时脚本会从这里下载自己，安装成 onekey 命令
 SCRIPT_URL="${ONEKEY_URL:-https://raw.githubusercontent.com/Aurivian11/onekey/main/install.sh}"
 
@@ -163,7 +163,7 @@ ip_menu() {
   echo "  7) 只用 IPv4"
   echo "  8) 只用 IPv6"
   echo "  0) 返回"
-  local c; read -r -p "请选择 [0-8]: " c
+  local c; read -r -p "请选择 [0-8]: " c || return
   case $c in
     1) set_link_ip both ;; 2) set_link_ip 4 ;; 3) set_link_ip 6 ;;
     4) set_out_ip auto ;; 5) set_out_ip prefer4 ;; 6) set_out_ip prefer6 ;;
@@ -376,7 +376,7 @@ xray_ver_menu() {
   echo "  2) 最新版              REALITY 只有 Xray 内核客户端（如 v2rayN）能连"
   echo "  3) 指定版本号"
   echo "  0) 返回"
-  local c; read -r -p "请选择 [0-3]: " c
+  local c; read -r -p "请选择 [0-3]: " c || return
   case $c in
     1) set_xray_ver compat ;;
     2) set_xray_ver latest ;;
@@ -616,7 +616,7 @@ set_cert() {   # set_cert ip|domain|self [域名]：申请 / 生成证书并记�
   OLD_SUB_URL=$(sub_on && sub_url sub)   # cert_apply 用来判断订阅地址变没变
   if [[ $mode == domain && -z $d ]]; then
     [[ $NONINT == 1 ]] && { red "域名证书需要 DOMAIN=你的域名"; return 1; }
-    read -r -p "输入已解析到本机的域名：" d
+    read -r -p "输入已解析到本机的域名：" d || return 1
     [[ -n $d ]] || return 1
   fi
   case $mode in
@@ -688,7 +688,7 @@ cert_menu() {
   echo "  3) 自签证书   容易被识别"
   echo "  4) 立即续签"
   echo "  0) 返回"
-  local c; read -r -p "请选择 [0-4]: " c
+  local c; read -r -p "请选择 [0-4]: " c || return
   case $c in
     1) set_cert domain && cert_apply ;;
     2) set_cert ip && cert_apply ;;
@@ -847,7 +847,7 @@ update_menu() {
   echo "  2) 更新内核（sing-box 换成最新版；Xray 按「Xray 版本」设置，会短暂断线）"
   echo "  3) Xray 版本（当前 $( [[ -x $BIN_XRAY ]] && xray_cur || echo 未安装)$(case ${XRAY_VER:-latest} in compat) echo "，兼容版";; latest) echo "，跟随最新版";; *) echo "，固定版本";; esac)）"
   echo "  0) 返回"
-  local c; read -r -p "请选择 [0-3]: " c
+  local c; read -r -p "请选择 [0-3]: " c || return
   case $c in
     1) self_update && { yellow "重新打开菜单..."; exec "$CMD"; } ;;
     2) update_cores ;;
@@ -965,7 +965,7 @@ hop_menu() {
   echo "  1) 开启 / 修改范围"
   echo "  2) 关闭"
   echo "  0) 返回"
-  local c; read -r -p "请选择 [0-2]: " c
+  local c; read -r -p "请选择 [0-2]: " c || return
   case $c in
     1) hop_set "$(ask "端口范围" "${r:-$(hop_default "$( . "$STATE/hy2.env"; echo "$PORT")")}")" ;;
     2) hop_set off ;;
@@ -976,7 +976,7 @@ hop_menu() {
 confirm_overwrite() {
   has "$1" || return 0
   [[ $NONINT == 1 ]] && return 0
-  local a; read -r -p "$2 已存在，覆盖重装？（旧链接和密码会作废）[Y/n]: " a
+  local a; read -r -p "$2 已存在，覆盖重装？（旧链接和密码会作废）[Y/n]: " a || return 1
   [[ $a != [nN] ]]
 }
 
@@ -993,7 +993,7 @@ add_hy2() {
   need_core hy2; gen_cert; ask_port "Hysteria2 (UDP)" hy2
   local hop=${HOP_RANGE:-}   # 非交互：HOP_RANGE=on 或 20000-29999 开启端口跳跃
   if [[ -z $hop && $NONINT != 1 ]]; then
-    local a; read -r -p "开启端口跳跃？（一段 UDP 端口都转给 Hysteria2，不容易被针对单个端口限速）[Y/n]: " a
+    local a; read -r -p "开启端口跳跃？（一段 UDP 端口都转给 Hysteria2，不容易被针对单个端口限速）[Y/n]: " a || a=n
     [[ $a != [nN] ]] && hop=$(ask "端口范围" "$(hop_default "$PORT")")
   fi
   save_state hy2 PORT="$PORT" PASS="$(rand_pw 24)"
@@ -1039,8 +1039,8 @@ add_argo() {
     echo "  1) 临时隧道（默认，免账号，重启后域名会变）"
     echo "  2) 固定隧道（需要 Cloudflare Tunnel Token 和自己的域名）"
     if [[ $(ask "请选择" 1) == 2 ]]; then
-      read -r -p "粘贴 Tunnel Token: " token
-      read -r -p "隧道绑定的域名（如 argo.example.com）: " domain
+      read -r -p "粘贴 Tunnel Token: " token || return 1
+      read -r -p "隧道绑定的域名（如 argo.example.com）: " domain || return 1
       yellow "请在 Cloudflare 后台把该域名的服务指向 http://localhost:$port"
     fi
   fi
@@ -1162,7 +1162,7 @@ show_links() {   # show_links [协议]  不带参数 = 全部
   if sub_on; then
     import_info
   elif [[ $NONINT != 1 && -f $CLASH ]]; then
-    local a; read -r -p "Clash 只能通过「订阅链接」导入，现在开启订阅并显示 Clash 二维码？[Y/n]: " a
+    local a; read -r -p "Clash 只能通过「订阅链接」导入，现在开启订阅并显示 Clash 二维码？[Y/n]: " a || a=n
     if [[ $a != [nN] ]]; then sub_enable; else echo "以后可在主菜单 3 开启订阅"; fi
   else
     echo "Clash（Verge / Meta）导入：运行 onekey sub 开启订阅，获取订阅链接和二维码"
@@ -1366,7 +1366,7 @@ sub_menu() {
   echo "  3) 关闭订阅"
   echo "  4) 显示 Clash 配置内容"
   echo "  0) 返回"
-  local c; read -r -p "请选择 [0-4]: " c
+  local c; read -r -p "请选择 [0-4]: " c || return
   case $c in 1) sub_enable ;; 2) sub_reset ;; 3) sub_disable ;; 4) gen_clients; [[ -f $CLASH ]] && cat "$CLASH" || yellow "还没有可用节点" ;; esac
 }
 
@@ -1388,7 +1388,7 @@ remove_proto() {
 
 uninstall_all() {
   if [[ $NONINT != 1 ]]; then
-    local a; read -r -p "确定卸载全部协议和程序？[Y/n]: " a; [[ $a == [nN] ]] && return
+    local a; read -r -p "确定卸载全部协议和程序？[Y/n]: " a || return; [[ $a == [nN] ]] && return
   fi
   svc_remove onekey-xray; svc_remove onekey-sb; svc_remove onekey-snell; svc_remove onekey-argo; svc_remove onekey-sub
   [[ -f /etc/sysctl.d/99-onekey-tcp.conf ]] && tcp_restore
@@ -1496,7 +1496,7 @@ tcp_menu() {
   echo "  2) 查看当前参数"
   echo "  3) 恢复调优前的参数"
   echo "  0) 返回"
-  local c; read -r -p "请选择 [0-3]: " c
+  local c; read -r -p "请选择 [0-3]: " c || return
   case $c in 1) tcp_tune ;; 2) tcp_show ;; 3) tcp_restore ;; esac
 }
 
@@ -1555,7 +1555,7 @@ proto_menu() {
   echo "  7) Snell v6"
   echo "  0) 返回"
   echo
-  local c; read -r -p "请选择 [0-7]: " c
+  local c; read -r -p "请选择 [0-7]: " c || return
   case $c in
     1) add_reality ;; 2) add_hy2 ;; 3) add_tuic ;; 4) add_anytls ;;
     5) add_argo ;; 6) add_ss ;; 7) add_snell ;; *) return ;;
@@ -1566,7 +1566,7 @@ pick_proto() {   # 让用户从已安装的协议里选一个
   for p in reality hy2 tuic anytls argo ss snell; do has $p && arr+=("$p"); done
   [[ ${#arr[@]} -eq 0 ]] && { yellow "还没有安装任何协议"; return 1; }
   for p in "${arr[@]}"; do echo "  $i) $(pretty $p)"; i=$((i+1)); done
-  local c; read -r -p "请选择: " c
+  local c; read -r -p "请选择: " c || return 1
   [[ $c =~ ^[0-9]+$ ]] && (( c>=1 && c<=${#arr[@]} )) || return 1
   PICKED=${arr[$((c-1))]}
 }
@@ -1590,7 +1590,7 @@ main_menu() {
     echo " 13) 卸载全部"
     echo "  0) 退出"
     echo
-    local c; read -r -p "请选择 [0-13]: " c
+    local c; read -r -p "请选择 [0-13]: " c || { echo; exit 0; }
     case $c in
       1) proto_menu ;;
       2) show_links ;;
