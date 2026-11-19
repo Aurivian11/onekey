@@ -6,8 +6,10 @@
 - **双内核按需安装**：Xray 支持的协议用 Xray，不支持的用 sing-box；选了协议才下载内核，不用了自动删除
 - **随机端口**（10000–60000），自动避开已占用端口
 - **IPv4 / IPv6 可选**：节点链接用 IPv4 + IPv6 / 只用 IPv4 / 只用 IPv6；出站可选优先或只用 IPv4 / IPv6
-- **三种证书**：域名证书 / IP 证书（默认，Let's Encrypt，自动续签，和 3x-ui 一样）/ 自签证书
-- **一键导入**：分享链接 + 二维码、Clash（mihomo）配置、带随机密钥的订阅链接
+- **三种证书**：域名证书 / IP 证书（默认，Let's Encrypt，自动续签，和 3x-ui 一样）/ 自签证书；80 端口不行自动改用 443 验证，快过期时菜单里红字提醒
+- **一键导入**：分享链接 + 二维码、Clash（mihomo）配置、带随机密钥的订阅链接；有 IP / 域名证书时订阅自动走 HTTPS
+- **Hysteria2 端口跳跃**：一段 UDP 端口都转给 Hysteria2，客户端轮换端口
+- **一键更新**：`onekey update` 更新脚本，`onekey update-core` 更新内核
 - **TCP 调优**：BBR + fq + 按内存自动调整缓冲区，可一键恢复
 - **干净卸载**：程序、配置、服务、内核参数全部还原
 
@@ -27,7 +29,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Aurivian11/onekey/main/install
 2. 安装完自动显示每个节点的链接和二维码，小火箭直接扫码导入。
 3. Clash 用户：查看链接时按回车开启订阅，会显示 Clash 订阅地址、`clash://` 一键导入链接和二维码（菜单 3 也能随时查看）。
 
-以安装 Hysteria2 为例：选协议 → 选证书（回车默认 IP 证书）→ 端口回车，自动申请证书并输出链接：
+以安装 Hysteria2 为例：选协议 → 选证书（回车默认 IP 证书）→ 端口回车 → 选择是否开端口跳跃，自动申请证书并输出链接：
 
 <p align="center"><img src="docs/install.png" width="760" alt="安装 Hysteria2 并申请 IP 证书"></p>
 
@@ -36,7 +38,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Aurivian11/onekey/main/install
 | 协议 | 内核 | 传输 | 说明 |
 |---|---|---|---|
 | VLESS-REALITY | Xray | TCP | Vision 流控，伪装 `www.amd.com`，免域名免证书 |
-| Hysteria2 | Xray | UDP | 默认 IP 证书，见下方「证书」 |
+| Hysteria2 | Xray | UDP | 默认 IP 证书，见下方「证书」；可开端口跳跃 |
 | VLESS-Argo | Xray + cloudflared | 不开端口 | 走 Cloudflare 隧道隐藏服务器 IP；支持临时隧道或固定隧道（Token + 自己的域名） |
 | Shadowsocks | Xray | TCP+UDP | aes-256-gcm / chacha20-ietf-poly1305 / 2022-blake3，适合当中转落地 |
 | TUIC v5 | sing-box | UDP | Xray 不支持；BBR 拥塞控制；默认 IP 证书 |
@@ -55,7 +57,9 @@ bash <(curl -Ls https://raw.githubusercontent.com/Aurivian11/onekey/main/install
 | Surge | 把菜单 2 里的 Snell 行粘贴到 `[Proxy]` | Snell v6 |
 
 - Clash 配置自带「节点选择」「自动选择（测速择优）」两个分组，国内直连、国外走代理。
-- 订阅由服务器上的 busybox httpd 提供，地址带 32 位随机密钥；目录不可浏览，密钥错误返回 404。订阅是明文 HTTP，地址等于全部节点的密码，泄露后用「更换订阅地址」让旧地址失效。
+- 订阅由服务器上的 busybox httpd 提供，地址带 32 位随机密钥；目录不可浏览，密钥错误返回 404。
+- **有 IP / 域名证书时订阅自动走 HTTPS**（socat 用同一张证书加密），传输中别人看不到节点密码；只有自签证书或没有证书时才是明文 HTTP。HTTP 和 HTTPS 切换时订阅地址会变，脚本会提示新地址。
+- 订阅地址等于全部节点的密码，泄露后用「更换订阅地址」让旧地址失效。
 - 请用 mihomo 内核的 Clash（如 Clash Verge Rev），原版 Clash 不支持 REALITY / Hysteria2 / TUIC / AnyTLS。
 
 > **REALITY 兼容性（2026-11 实测）**：Xray 从 v26.7.11 起，REALITY 服务端与 sing-box 内核、mihomo（Clash Meta）内核的客户端不兼容，Xray 内核客户端（如 v2rayN）可正常连接；其它协议不受影响。
@@ -72,7 +76,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Aurivian11/onekey/main/install
 - 修改「节点地址」后链接会变，客户端需要重新导入或更新订阅；修改「出站」不影响链接。
 - VLESS-Argo 始终使用 Cloudflare 隧道域名，不受「节点地址」影响。
 
-## 证书（Hysteria2 / TUIC / AnyTLS）
+## 证书（Hysteria2 / TUIC / AnyTLS / HTTPS 订阅）
 
 第一次安装这三个协议之一时选择，以后在菜单 **11** 随时切换。REALITY、Argo、SS、Snell 不需要证书。
 
@@ -81,15 +85,39 @@ bash <(curl -Ls https://raw.githubusercontent.com/Aurivian11/onekey/main/install
 | 证书 | 隐蔽性 | 条件 | 客户端 |
 |---|---|---|---|
 | 域名证书 | 最好 | 一个已解析到本机的域名（Cloudflare 要关小黄云） | 正常验证证书 |
-| **IP 证书（默认）** | 较好 | 不需要域名；TCP 80 端口能从外网访问 | 正常验证证书 |
+| **IP 证书（默认）** | 较好 | 不需要域名；TCP 80 或 443 端口能从外网访问 | 正常验证证书 |
 | 自签证书 | 差，主动探测一眼能认出 | 无 | 必须开「跳过证书验证」 |
 
-- 域名证书和 IP 证书都用 [acme.sh](https://github.com/acmesh-official/acme.sh) 向 Let's Encrypt 申请。IP 证书是 Let's Encrypt 的短期证书（约 6 天），脚本设置为每 3 天自动续签一次，续签后自动重启内核；域名证书 90 天，到期前 30 天续签。
-- 申请和续签时 acme.sh 会临时占用 **80 端口**做验证，所以 80 端口要空着（不要跑 nginx 之类），服务商安全组要放行 TCP 80。
+- 域名证书和 IP 证书都用 [acme.sh](https://github.com/acmesh-official/acme.sh) 向 Let's Encrypt 申请。IP 证书是 Let's Encrypt 的短期证书（约 6 天），脚本设置为每 3 天自动续签一次，续签后自动重启内核和订阅服务；域名证书 90 天，到期前 30 天续签。
+- 申请时先用 **TCP 80** 验证；80 被占用或不通时自动改用 **TCP 443**（TLS-ALPN 验证）。哪种成功，以后续签就沿用哪种。两个端口都不行才会失败。
+- **双保险**：除了 acme.sh 自己的续签，脚本每天还会检查一次；IP 证书剩不到 2 天（域名证书剩不到 20 天）说明续签失败了，会自动按原类型重新申请。
+- **过期提醒**：证书 2 天内到期或已过期时，打开菜单、`onekey status`、`onekey cert` 都会显示红字警告和原因。
+- **不用就停**：删掉最后一个用证书的协议（并且订阅已关闭）时自动停止续签，不浪费 Let's Encrypt 的申请次数；以后再装 Hysteria2 / TUIC / AnyTLS 时按原来的类型自动重新申请，不再询问。
 - 节点地址设为 IPv4 + IPv6 时，IP 证书会同时包含两个 IP；IPv6 验证不通过时自动只申请 IPv4，此时 IPv6 链接会跳过证书验证。
 - 申请失败时会自动先用自签证书，节点照常可用，之后可在菜单 11 重新申请。
 - 换证书后链接里的 SNI / 跳过验证会变，客户端需要重新导入或更新订阅。
 - 1.0 版装的节点保持自签证书不变，想换就在菜单 11 选择。
+
+## Hysteria2 端口跳跃
+
+安装 Hysteria2 时可选择开启，以后在菜单 **12** 开启、改范围或关闭。
+
+- 用 nftables 把一段 UDP 端口（默认 20000–29999，和其它协议的端口冲突时自动换一段）全部转给 Hysteria2 的端口，客户端每隔一段时间换一个端口连接，不容易被针对单个端口限速或封锁。
+- 链接里加 `mport=范围`，Clash 配置里加 `ports` 和 `hop-interval`；支持的客户端（Clash Meta / mihomo、sing-box、v2rayN 等）会自动轮换端口，不支持的照常用单端口。
+- 规则由 `onekey-hop` 服务开机自动加载；删除 Hysteria2 或卸载时自动清除。
+- **服务商的安全组 / 防火墙要放行这一段 UDP 端口。**
+- 部分 OpenVZ / LXC 小鸡不能用 nftables，这时无法开启，Hysteria2 照常用单端口。
+
+## 更新
+
+菜单 **10**，或命令行：
+
+```bash
+onekey update        # 更新脚本本身（节点参数和链接不变，会自动按新版规则更新服务）
+onekey update-core   # 把已安装的 Xray / sing-box 换成最新版（会短暂断线）
+```
+
+内核不会自动更新，需要时手动运行。
 
 ## TCP 调优
 
@@ -111,6 +139,7 @@ SNI=www.microsoft.com onekey add reality
 IP_MODE=6 onekey add hy2        # 第一次安装时直接指定只用 IPv6（4 | 6 | both）
 CERT=self onekey add tuic       # 第一次装 Hysteria2 / TUIC / AnyTLS 时指定证书（ip 默认 | domain | self）
 CERT=domain DOMAIN=example.com onekey add hy2
+HOP_RANGE=on onekey add hy2     # 安装 Hysteria2 时开启端口跳跃（on 用默认范围，也可写 20000-29999）
 onekey links                # 查看全部链接
 onekey sub                  # 开启订阅 / 查看订阅地址（sub reset 换地址，sub off 关闭）
 onekey clash                # 输出 Clash 配置
@@ -125,6 +154,9 @@ onekey ip out prefer6       # 出站优先 IPv6（auto | prefer4 | prefer6 | onl
 onekey cert                 # 查看证书和到期时间
 onekey cert ip              # 换成 IP 证书（domain <域名> 换域名证书，self 换自签）
 onekey cert renew           # 立即续签
+onekey hop on               # Hysteria2 端口跳跃：on 默认范围 / 20000-29999 指定范围 / off 关闭
+onekey update               # 更新脚本
+onekey update-core          # 更新内核
 onekey uninstall            # 卸载全部
 ```
 
@@ -161,14 +193,16 @@ bash test_links.sh
 | `/etc/onekey/` | 各协议参数、内核配置、证书、链接、Clash 配置、订阅文件（权限 600） |
 | `/usr/local/bin/onekey` | 菜单命令 |
 | `/usr/local/bin/xray`、`sing-box`、`snell-server`、`cloudflared` | 按需安装的内核 |
-| `onekey-xray` / `onekey-sb` / `onekey-snell` / `onekey-argo` / `onekey-sub` | 系统服务 |
+| `onekey-xray` / `onekey-sb` / `onekey-snell` / `onekey-argo` / `onekey-sub` / `onekey-hop` | 系统服务 |
+| root 的 crontab | `onekey cert cron` 每天检查一次证书（只在用 IP / 域名证书时存在） |
 | `/etc/sysctl.d/99-onekey-tcp.conf` | TCP 调优参数 |
 | `/root/.acme.sh/` | acme.sh（IP / 域名证书的申请和续签；卸载时只删本脚本的证书记录，acme.sh 保留） |
 
 ## 常见问题
 
 - **连不上**：先确认服务商的防火墙 / 安全组放行了端口（Hysteria2、TUIC 是 UDP）；菜单 7 看服务是否在运行。
-- **Hysteria2 / TUIC / AnyTLS 报证书错误**：`onekey cert` 看证书是否过期；IP / 域名证书续签失败多半是 80 端口被占用或被防火墙拦了，处理后 `onekey cert renew`。自签证书需要客户端打开「跳过证书验证 / allowInsecure」。
+- **Hysteria2 / TUIC / AnyTLS 报证书错误**：`onekey cert` 看证书是否过期；IP / 域名证书续签失败多半是 TCP 80 和 443 都被占用或被防火墙拦了，处理后 `onekey cert renew`。
+- **Hysteria2 端口跳跃连不上**：确认服务商安全组放行了整段 UDP 端口；`onekey hop` 查看范围。自签证书需要客户端打开「跳过证书验证 / allowInsecure」。
 - **Argo 链接失效**：临时隧道在服务器或服务重启后域名会变，菜单 2 重新查看；订阅会自动更新。
 - **想换伪装网站**：重新添加 REALITY 时在「伪装域名 (SNI)」填其它支持 TLS 1.3 的大站。
 

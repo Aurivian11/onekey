@@ -10,7 +10,7 @@
 # =============================================================
 set -o pipefail
 
-ONEKEY_VER="1.1.0"
+ONEKEY_VER="1.2.0"
 # 一键安装时脚本会从这里下载自己，安装成 onekey 命令
 SCRIPT_URL="${ONEKEY_URL:-https://raw.githubusercontent.com/Aurivian11/onekey/main/install.sh}"
 
@@ -172,11 +172,18 @@ ip_menu() {
 }
 
 port_used() { ss -Hlntu 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]$1\$"; }
+tcp_busy() { ss -Hltn "sport = :$1" 2>/dev/null | grep -q .; }
+port_owner() { ss -Hltnp "sport = :$1" 2>/dev/null | grep -o 'users:(("[^"]*' | head -1 | cut -d'"' -f2; }
+hop_range() { has hy2 && ( HOP=""; . "$STATE/hy2.env"; echo "$HOP" ); }   # Hysteria2 端口跳跃范围，如 20000-29999
+in_hop() {   # in_hop 端口：是否落在端口跳跃范围里（这些 UDP 端口会被转给 Hysteria2）
+  local r; r=$(hop_range); [[ -n $r ]] || return 1
+  (( $1 >= ${r%-*} && $1 <= ${r#*-} ))
+}
 rand_port() {
   local p
   for _ in $(seq 1 50); do
     p=$(( (RANDOM << 15 | RANDOM) % 50001 + 10000 ))
-    port_used "$p" || { echo "$p"; return; }
+    port_used "$p" || in_hop "$p" || { echo "$p"; return; }
   done
   echo 34567
 }
@@ -186,15 +193,16 @@ ask_port() {   # ask_port 名称 协议 -> PORT（环境变量 PORT_SET 可指�
     PORT=$(ask "$1 端口" "$def")
     [[ $PORT =~ ^[0-9]+$ ]] && (( PORT > 0 && PORT < 65536 )) || { red "端口无效"; [[ $NONINT == 1 ]] && die "端口无效"; continue; }
     port_used "$PORT" && ! grep -qs "PORT='$PORT'" "$STATE/$2.env" && { red "端口 $PORT 已被占用"; [[ $NONINT == 1 ]] && die "端口被占用"; continue; }
+    [[ $2 != hy2 ]] && in_hop "$PORT" && { red "端口 $PORT 在 Hysteria2 端口跳跃范围 $(hop_range) 里"; [[ $NONINT == 1 ]] && die "端口在端口跳跃范围里"; continue; }
     break
   done
 }
 
-open_port() {   # open_port 端口 tcp|udp|both
+open_port() {   # open_port 端口或范围(a-b) tcp|udp|both
   local p=$1 t=$2
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-    [[ $t != udp ]] && ufw allow "$p"/tcp >/dev/null
-    [[ $t != tcp ]] && ufw allow "$p"/udp >/dev/null
+    [[ $t != udp ]] && ufw allow "${p/-/:}"/tcp >/dev/null
+    [[ $t != tcp ]] && ufw allow "${p/-/:}"/udp >/dev/null
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     [[ $t != udp ]] && firewall-cmd -q --permanent --add-port="$p"/tcp
     [[ $t != tcp ]] && firewall-cmd -q --permanent --add-port="$p"/udp
@@ -371,7 +379,20 @@ cert_expiry() {
   date -d "$e" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$e"
 }
 uses_cert() { has hy2 || has tuic || has anytls; }
+ca_mode() { [[ $CERT_MODE == ip || $CERT_MODE == domain ]]; }   # 正式证书（Let's Encrypt 签发）
+ca_cert() { ca_mode && [[ -s $CERT_DIR/cert.pem ]]; }          # 正式证书且文件在
+cert_needed() { uses_cert || sub_on; }                           # 还有东西用证书（订阅用它开 HTTPS）
 cert_main() { echo "${CERT_NAMES%% *}"; }   # acme.sh 里记录这张证书用的名字
+cert_ok_for() { openssl x509 -checkend "$1" -noout -in "$CERT_DIR/cert.pem" >/dev/null 2>&1; }   # 证书 $1 秒后仍有效
+cert_warn() {   # 正式证书已过期 / 2 天内到期时显示红字警告
+  ca_cert || return 0
+  if ! cert_ok_for 0; then
+    red "警告：证书已于 $(cert_expiry) 过期，Hysteria2 / TUIC / AnyTLS 和 HTTPS 订阅现在连不上！"
+  elif ! cert_ok_for 172800; then
+    red "警告：证书 $(cert_expiry) 到期，自动续签好像没成功"
+  else return 0; fi
+  yellow "  常见原因：TCP 80 和 443 端口都被占用，或被服务商防火墙拦截。处理后运行 onekey cert renew（日志：$ACME_LOG）"
+}
 tls_opts() {   # tls_opts 主机 -> "SNI 跳过验证(1/0)"
   case $CERT_MODE in
     domain) echo "$CERT_DOMAIN 0" ;;
@@ -383,7 +404,32 @@ tls_opts() {   # tls_opts 主机 -> "SNI 跳过验证(1/0)"
 cert_reload() {   # 证书换了以后重启用到证书的内核（acme.sh 续签后自动调用 onekey cert reload）
   has hy2 && [[ -f $XRAY_CONF ]] && svc restart onekey-xray
   { has tuic || has anytls; } && [[ -f $SB_CONF ]] && svc restart onekey-sb
+  sub_on && ca_cert && svc restart onekey-sub   # HTTPS 订阅也要换上新证书
   return 0
+}
+
+# 每天检查一次（acme.sh 自己的续签之外再兜底）：证书快过期说明 acme.sh 续签失败了，
+# 这时按原类型重新申请（会依次试 80、443 端口），成功后重启内核、更新链接
+CRON_LINE="17 4 * * * $CMD cert cron >/dev/null 2>&1"
+cert_cron_set() {   # cert_cron_set on|off
+  command -v crontab >/dev/null 2>&1 || return 0
+  local cur; cur=$(crontab -l 2>/dev/null | grep -vF "$CMD cert cron")
+  if [[ $1 == on ]]; then printf '%s\n%s\n' "$cur" "$CRON_LINE" | sed '/^$/d' | crontab -
+  else printf '%s\n' "$cur" | sed '/^$/d' | crontab -; fi
+}
+cert_cron() {
+  ca_cert || return 0
+  local need=172800; [[ $CERT_MODE == domain ]] && need=1728000   # IP 证书剩 2 天、域名证书剩 20 天
+  cert_ok_for "$need" && return 0
+  echo "[$(date '+%F %T')] 证书 $(cert_expiry) 到期，acme.sh 没续签成功，重新申请" >>"$ACME_LOG"
+  NONINT=1 set_cert "$CERT_MODE" "$CERT_DOMAIN" >>"$ACME_LOG" 2>&1 && cert_apply >/dev/null 2>&1
+}
+
+cert_release() {   # 没有东西用证书时停止续签；以后再需要时按原来的类型自动重新申请
+  ca_mode && ! cert_needed || return 0
+  acme_forget "$(cert_main)"; cert_cron_set off
+  rm -f "$CERT_DIR/cert.pem" "$CERT_DIR/key.pem"
+  yellow "已没有协议用到证书，停止向 Let's Encrypt 续签；以后再装 Hysteria2 / TUIC / AnyTLS 时会自动重新申请"
 }
 
 acme_install() {
@@ -409,21 +455,22 @@ acme_forget() {   # acme_forget 名字：不再续签这张证书
 }
 
 acme_issue() {   # acme_issue ip|domain 名字... -> 申请成功后装到 $CERT_DIR
+  # 先用 TCP 80（HTTP 验证），80 被占用或验证不通过再用 TCP 443（TLS-ALPN 验证）；
+  # 哪种成功 acme.sh 就记住哪种，以后续签沿用
   local kind=$1; shift
-  local args=() n
+  local args=() n p ok=0 mode=()
   for n in "$@"; do args+=(-d "$n"); done
-  if ss -Hltn 'sport = :80' 2>/dev/null | grep -q .; then
-    red "80 端口已被占用：$(ss -Hltnp 'sport = :80' 2>/dev/null | grep -o 'users:(("[^"]*' | head -1 | cut -d'"' -f2)"
-    yellow "申请和续签证书时 Let's Encrypt 要访问本机 80 端口，请先停掉占用 80 端口的程序"
-    return 1
-  fi
-  open_port 80 tcp
   local extra=()
   [[ $kind == ip ]] && extra=(--certificate-profile shortlived --days 3)   # IP 证书约 6 天有效，3 天续签一次
-  yellow "向 Let's Encrypt 申请证书：$*（要用 80 端口验证，约半分钟）..."
-  if ! $ACME --issue "${args[@]}" --standalone --httpport 80 --server letsencrypt --keylength ec-256 --force "${extra[@]}" >>"$ACME_LOG" 2>&1; then
-    acme_forget "$1"; return 1
-  fi
+  for p in ${ACME_PORTS:-80 443}; do
+    if tcp_busy "$p"; then yellow "TCP $p 端口被 $(port_owner "$p") 占用，不能用它验证"; continue; fi
+    [[ $p == 80 ]] && mode=(--standalone --httpport 80) || mode=(--alpn --tlsport 443)
+    open_port "$p" tcp
+    yellow "向 Let's Encrypt 申请证书：$*（用 TCP $p 端口验证，约半分钟）..."
+    if $ACME --issue "${args[@]}" "${mode[@]}" --server letsencrypt --keylength ec-256 --force "${extra[@]}" >>"$ACME_LOG" 2>&1; then ok=1; break; fi
+    acme_forget "$1"; yellow "TCP $p 端口验证没通过"
+  done
+  [[ $ok == 1 ]] || return 1
   mkdir -p "$CERT_DIR"
   # 先装到临时位置确认成功，再替换正在用的证书
   local td; td=$(mktemp -d)
@@ -453,7 +500,7 @@ cert_ip() {   # IP 证书：按「IP 设置」申请；IPv4+IPv6 一起申请失
       return 0
     fi
   done
-  red "IP 证书申请失败：请确认 80 端口（TCP）能从外网访问，没有被服务商防火墙拦截（日志：$ACME_LOG）"
+  red "IP 证书申请失败：TCP 80 或 443 端口至少要有一个空着、能从外网访问（服务商安全组要放行）（日志：$ACME_LOG）"
   return 1
 }
 
@@ -476,7 +523,7 @@ cert_domain() {   # 域名证书：域名必须已解析到本机
   fi
   [[ -n $aaaa && -z $IP6 ]] && yellow "提示：域名有 AAAA 记录但本机没有 IPv6，Let's Encrypt 可能优先走 IPv6 导致验证失败"
   acme_install || return 1
-  acme_issue domain "$d" || { red "域名证书申请失败：请确认 80 端口（TCP）能从外网访问（日志：$ACME_LOG）"; return 1; }
+  acme_issue domain "$d" || { red "域名证书申请失败：TCP 80 或 443 端口至少要有一个空着、能从外网访问（日志：$ACME_LOG）"; return 1; }
   CERT_DOMAIN=$d; CERT_NAMES=$d
 }
 
@@ -489,7 +536,8 @@ cert_self() {
 }
 
 set_cert() {   # set_cert ip|domain|self [域名]：申请 / 生成证书并记录；失败时原来的证书不动
-  local mode=$1 d=$2 old_mode=$CERT_MODE old_main; old_main=$(cert_main)
+  local mode=$1 d=$2 old_mode=$CERT_MODE old_main old_label; old_main=$(cert_main); old_label=$(cert_label)
+  OLD_SUB_URL=$(sub_on && sub_url sub)   # cert_apply 用来判断订阅地址变没变
   if [[ $mode == domain && -z $d ]]; then
     [[ $NONINT == 1 ]] && { red "域名证书需要 DOMAIN=你的域名"; return 1; }
     read -r -p "输入已解析到本机的域名：" d
@@ -502,32 +550,45 @@ set_cert() {   # set_cert ip|domain|self [域名]：申请 / 生成证书并记�
     *)      red "未知证书类型：$mode"; return 1 ;;
   esac
   CERT_MODE=$mode; save_cert_env
+  [[ $(cert_label) != "$old_label" ]] && CERT_CHANGED=1 || CERT_CHANGED=0
   [[ ($old_mode == ip || $old_mode == domain) && -n $old_main && $old_main != "$(cert_main)" ]] && acme_forget "$old_main"
+  ca_mode && cert_cron_set on || cert_cron_set off
   green "证书：$(cert_label)$( [[ $mode != self ]] && echo "，到期 $(cert_expiry)")"
 }
 
-gen_cert() {   # 第一次装 Hysteria2 / TUIC / AnyTLS 时选择证书（环境变量 CERT=ip|domain|self、DOMAIN= 可跳过询问）
+gen_cert() {   # 装 Hysteria2 / TUIC / AnyTLS 时准备证书（环境变量 CERT=ip|domain|self、DOMAIN= 可跳过询问）
   [[ -n $CERT_MODE && -s $CERT_DIR/cert.pem ]] && return
-  local m=${CERT:-}
+  local m=${CERT:-} d=${DOMAIN:-}
+  if [[ -z $m && -n $CERT_MODE ]]; then   # 之前用过、后来没协议用而停掉的证书：按原类型直接重新申请
+    m=$CERT_MODE; d=${d:-$CERT_DOMAIN}
+    yellow "按之前的设置重新申请：$(cert_label)"
+  fi
   if [[ -z $m && $NONINT != 1 ]]; then
     echo
     echo "Hysteria2 / TUIC / AnyTLS 需要 TLS 证书，选择证书类型（以后可在主菜单「证书设置」修改）："
     echo "  1) 域名证书   最不容易被识别，需要一个已解析到本机的域名"
-    echo "  2) IP 证书    Let's Encrypt 签发，不需要域名，自动续签（需要 80 端口能从外网访问）"
+    echo "  2) IP 证书    Let's Encrypt 签发，不需要域名，自动续签（TCP 80 或 443 端口要能从外网访问）"
     echo "  3) 自签证书   什么都不需要，但容易被识别，客户端要跳过证书验证"
     case $(ask "请选择" 2) in 1) m=domain;; 3) m=self;; *) m=ip;; esac
   fi
-  if ! set_cert "${m:-ip}" "${DOMAIN:-}"; then
+  if ! set_cert "${m:-ip}" "$d"; then
     yellow "先改用自签证书，节点照常可用；以后可在主菜单「证书设置」重新申请"
     set_cert self
   fi
+  sub_refresh
 }
 
 cert_apply() {   # 换证书后：重启内核，更新链接 / Clash / 订阅
   cert_reload
-  if uses_cert; then
-    gen_clients >/dev/null 2>&1
+  sub_on && sub_service
+  gen_clients >/dev/null 2>&1
+  if uses_cert && [[ ${CERT_CHANGED:-1} == 1 ]]; then
     yellow "Hysteria2 / TUIC / AnyTLS 的链接已更新（SNI / 证书验证变了），客户端需重新导入或更新订阅"
+  elif uses_cert; then
+    green "证书已换新，节点链接不变"
+  fi
+  if sub_on && [[ $(sub_url sub) != "${OLD_SUB_URL:-}" ]]; then
+    yellow "订阅地址变成：$(sub_url sub)（客户端需重新导入订阅）"
   fi
 }
 cert_renew() {
@@ -543,10 +604,11 @@ cert_renew() {
 cert_menu() {
   echo
   echo "当前证书：$(cert_label)$( [[ -s $CERT_DIR/cert.pem ]] && echo "    到期：$(cert_expiry)")"
-  echo "（证书只给 Hysteria2 / TUIC / AnyTLS 用；REALITY、Argo、SS、Snell 不需要证书）"
+  cert_warn
+  echo "（证书给 Hysteria2 / TUIC / AnyTLS 和 HTTPS 订阅用；REALITY、Argo、SS、Snell 不需要证书）"
   echo
   echo "  1) 域名证书   最不容易被识别，需要已解析到本机的域名"
-  echo "  2) IP 证书    Let's Encrypt，自动续签（推荐，需要 80 端口）"
+  echo "  2) IP 证书    Let's Encrypt，自动续签（推荐，需要 TCP 80 或 443 端口）"
   echo "  3) 自签证书   容易被识别"
   echo "  4) 立即续签"
   echo "  0) 返回"
@@ -668,6 +730,156 @@ update_cores() {
   [[ -x $BIN_XRAY ]] && { any=1; install_xray force; [[ -f $XRAY_CONF ]] && svc restart onekey-xray; }
   [[ -x $BIN_SB ]]   && { any=1; install_singbox force; [[ -f $SB_CONF ]] && svc restart onekey-sb; }
   [[ $any == 0 ]] && yellow "还没有安装任何内核（选择协议时才会安装）"
+  return 0
+}
+
+# ---------------- 更新脚本 ----------------
+self_update() {   # 下载最新版脚本替换 onekey 命令，然后让新版做必要的迁移
+  local tmp nv; tmp=$(mktemp)
+  yellow "下载最新版脚本..."
+  if ! curl -fsSL -o "$tmp" "$SCRIPT_URL" || ! bash -n "$tmp" 2>/dev/null || ! grep -q '^ONEKEY_VER=' "$tmp"; then
+    rm -f "$tmp"; red "下载失败或文件不完整，没有更新"; return 1
+  fi
+  nv=$(grep -m1 '^ONEKEY_VER=' "$tmp" | cut -d'"' -f2)
+  if [[ $nv == "$ONEKEY_VER" && $1 != force ]]; then rm -f "$tmp"; green "已经是最新版 v$ONEKEY_VER"; return 0; fi
+  install -m 755 "$tmp" "$CMD"; rm -f "$tmp"
+  green "脚本已更新：v$ONEKEY_VER → v$nv（节点参数和链接不变）"
+  "$CMD" migrate
+}
+migrate() {   # 新版脚本第一次运行时调用：按新规则更新服务，不改节点参数
+  sub_refresh
+  ca_cert && cert_cron_set on
+  if [[ -n $(hop_range) ]]; then hop_apply >/dev/null 2>&1 && hop_service on; fi
+  ls "$STATE"/*.env >/dev/null 2>&1 && gen_clients >/dev/null 2>&1
+  return 0
+}
+update_menu() {
+  echo
+  echo "  1) 更新脚本（onekey 本身，当前 v$ONEKEY_VER）"
+  echo "  2) 更新内核（已安装的 Xray / sing-box 换成最新版，会短暂断线）"
+  echo "  0) 返回"
+  local c; read -r -p "请选择 [0-2]: " c
+  case $c in
+    1) self_update && { yellow "重新打开菜单..."; exec "$CMD"; } ;;
+    2) update_cores ;;
+  esac
+}
+
+# ---------------- Hysteria2 端口跳跃 ----------------
+# 用 nftables 把一段 UDP 端口全部转到 Hysteria2 的端口，客户端在这些端口之间轮换，
+# 不容易被针对单个端口限速 / 封锁。规则开机由 onekey-hop 服务重新加载
+HOP_DEFAULTS="20000-29999 30000-39999 40000-49999"
+hop_ok_range() {   # hop_ok_range 范围 Hysteria2端口：检查格式，以及范围里没有别的程序在用 UDP 端口
+  local r=$1 hp=$2 a b p
+  [[ $r =~ ^([0-9]+)-([0-9]+)$ ]] || { red "范围格式不对，例：20000-29999"; return 1; }
+  a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}
+  (( a >= 1024 && b <= 65535 && a < b )) || { red "范围要在 1024-65535 之间，并且前小后大"; return 1; }
+  for p in $(ss -Hlnu 2>/dev/null | awk '{print $5}' | grep -oE '[0-9]+$' | sort -u); do
+    if (( p >= a && p <= b )) && [[ $p != "$hp" ]]; then red "UDP 端口 $p 已有程序在用，并且在 $r 里，换一个范围"; return 1; fi
+  done
+}
+hop_default() {   # hop_default Hysteria2端口 -> 第一个没冲突的默认范围
+  local r; for r in $HOP_DEFAULTS; do hop_ok_range "$r" "$1" >/dev/null 2>&1 && { echo "$r"; return; }; done
+  echo "${HOP_DEFAULTS%% *}"
+}
+hop_need_nft() {
+  if ! command -v nft >/dev/null 2>&1; then
+    yellow "安装 nftables..."
+    case $PKG in
+      apt) DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables >/dev/null 2>&1 \
+             || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables >/dev/null; } ;;
+      apk) apk add --no-cache nftables >/dev/null ;;
+      dnf|yum) $PKG install -y -q nftables >/dev/null ;;
+    esac
+  fi
+  command -v nft >/dev/null 2>&1 && nft list tables >/dev/null 2>&1 || { red "nftables 不可用（部分 OpenVZ / LXC 小鸡不支持），不能开端口跳跃"; return 1; }
+}
+hop_apply() {   # 按 hy2.env 里的 HOP 重新写规则；没有 HOP 就删掉规则
+  command -v nft >/dev/null 2>&1 && nft delete table inet onekey_hop >/dev/null 2>&1
+  local r p; r=$(hop_range); [[ -n $r ]] || return 0
+  p=$( . "$STATE/hy2.env"; echo "$PORT")
+  hop_need_nft || return 1
+  # pre：外面进来的；out：本机自己连自己的公网 IP（test_links.sh 在服务器上测试时用）
+  nft -f - <<EOF || { red "写入端口跳跃规则失败"; return 1; }
+table inet onekey_hop {
+  chain pre {
+    type nat hook prerouting priority -100; policy accept;
+    udp dport $r counter redirect to :$p
+  }
+  chain out {
+    type nat hook output priority -100; policy accept;
+    fib daddr type local udp dport $r counter redirect to :$p
+  }
+}
+EOF
+}
+hop_service() {   # hop_service on|off：开机自动加载规则
+  local name=onekey-hop
+  if [[ $1 == off ]]; then
+    { [[ -f /etc/systemd/system/$name.service ]] || [[ -f /etc/init.d/$name ]]; } && svc_remove $name
+    return 0
+  fi
+  if [[ $INIT == systemd ]]; then
+    cat >/etc/systemd/system/$name.service <<EOF
+[Unit]
+Description=OneKey Hysteria2 port hopping
+After=network.target nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$CMD hop apply
+ExecStop=$(command -v nft) delete table inet onekey_hop
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload; systemctl enable $name >/dev/null 2>&1; systemctl start $name >/dev/null 2>&1
+  else
+    cat >/etc/init.d/$name <<EOF
+#!/sbin/openrc-run
+description="OneKey Hysteria2 port hopping"
+depend() { need net; after firewall nftables; }
+start() { $CMD hop apply; }
+stop() { nft delete table inet onekey_hop >/dev/null 2>&1; return 0; }
+EOF
+    chmod +x /etc/init.d/$name; rc-update add $name default >/dev/null 2>&1; rc-service $name start >/dev/null 2>&1
+  fi
+}
+hop_set() {   # hop_set 范围|on|off
+  has hy2 || { yellow "还没有安装 Hysteria2"; return 1; }
+  local r=$1 p; p=$( . "$STATE/hy2.env"; echo "$PORT")
+  if [[ $r == off ]]; then r=""
+  else
+    [[ -z $r || $r == on ]] && r=$(hop_default "$p")
+    r=${r/:/-}; hop_ok_range "$r" "$p" || return 1
+  fi
+  sed -i '/^HOP=/d' "$STATE/hy2.env"; [[ -n $r ]] && echo "HOP='$r'" >>"$STATE/hy2.env"
+  if ! hop_apply; then sed -i '/^HOP=/d' "$STATE/hy2.env"; hop_apply; hop_service off; return 1; fi
+  if [[ -n $r ]]; then
+    open_port "$r" udp; hop_service on
+    green "端口跳跃已开启：UDP $r → Hysteria2 端口 $p"
+    yellow "服务商安全组也要放行 UDP $r；客户端链接 / 订阅已更新，需重新导入"
+  else
+    hop_service off; green "端口跳跃已关闭"
+  fi
+  gen_clients >/dev/null 2>&1
+}
+hop_menu() {
+  has hy2 || { yellow "还没有安装 Hysteria2"; return; }
+  local r; r=$(hop_range)
+  echo
+  echo "Hysteria2 端口跳跃：$([[ -n $r ]] && echo "已开启 UDP $r → 端口 $( . "$STATE/hy2.env"; echo "$PORT")" || echo "未开启")"
+  echo "（客户端在一段端口之间轮换，不容易被针对单个端口限速 / 封锁；需要客户端支持，如 Clash Meta / mihomo、sing-box、v2rayN；不支持的客户端照常用单端口）"
+  echo
+  echo "  1) 开启 / 修改范围"
+  echo "  2) 关闭"
+  echo "  0) 返回"
+  local c; read -r -p "请选择 [0-2]: " c
+  case $c in
+    1) hop_set "$(ask "端口范围" "${r:-$(hop_default "$( . "$STATE/hy2.env"; echo "$PORT")")}")" ;;
+    2) hop_set off ;;
+  esac
 }
 
 # ---------------- 各协议安装 ----------------
@@ -689,8 +901,15 @@ add_reality() {
 add_hy2() {
   confirm_overwrite hy2 Hysteria2 || return
   need_core hy2; gen_cert; ask_port "Hysteria2 (UDP)" hy2
+  local hop=${HOP_RANGE:-}   # 非交互：HOP_RANGE=on 或 20000-29999 开启端口跳跃
+  if [[ -z $hop && $NONINT != 1 ]]; then
+    local a; read -r -p "开启端口跳跃？（一段 UDP 端口都转给 Hysteria2，不容易被针对单个端口限速）[y/N]: " a
+    [[ $a == [yY] ]] && hop=$(ask "端口范围" "$(hop_default "$PORT")")
+  fi
   save_state hy2 PORT="$PORT" PASS="$(rand_pw 24)"
-  open_port "$PORT" udp; apply_xray && show_links hy2
+  open_port "$PORT" udp
+  if [[ -n $hop && $hop != off ]]; then hop_set "$hop" || yellow "端口跳跃没开成，Hysteria2 照常用单端口"; else hop_set off >/dev/null 2>&1; fi
+  apply_xray && show_links hy2
 }
 add_tuic() {
   confirm_overwrite tuic TUIC || return
@@ -792,13 +1011,13 @@ NAME_PREFIX=${NAME_PREFIX:-$(hostname -s 2>/dev/null)}
 link_for() {   # link_for 协议 主机 -> 链接
   local p=$1 h=$2 hb=$2
   [[ $h == *:* ]] && hb="[$h]"
-  ( . "$STATE/$p.env"
+  ( HOP=""; . "$STATE/$p.env"
   local tag; tag=$(uri "$NAME_PREFIX-$p$( [[ $h == *:* ]] && echo -v6)")
   local sni ins ti="" tt=""; read -r sni ins <<<"$(tls_opts "$h")"; sni=$(uri "$sni")
   [[ $ins == 1 ]] && { ti="&insecure=1&allowInsecure=1"; tt="&allow_insecure=1&allowInsecure=1"; }
   case $p in
     reality) echo "vless://$UUID@$hb:$PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$SNI&fp=chrome&pbk=$PUB&sid=$SID&type=tcp&headerType=none#$tag" ;;
-    hy2)     echo "hysteria2://$PASS@$hb:$PORT?sni=$sni&alpn=h3$ti#$tag" ;;
+    hy2)     echo "hysteria2://$PASS@$hb:$PORT?sni=$sni&alpn=h3$ti${HOP:+&mport=$HOP}#$tag" ;;
     tuic)    echo "tuic://$UUID:$PASS@$hb:$PORT?sni=$sni&alpn=h3&congestion_control=bbr&udp_relay_mode=native$tt#$tag" ;;
     anytls)  echo "anytls://$PASS@$hb:$PORT?sni=$sni$ti#$tag" ;;
     ss)      echo "ss://$(b64url "$METHOD:$PASS")@$hb:$PORT#$tag" ;;
@@ -858,12 +1077,12 @@ sub_on() { [[ -f $SUB_ENV ]]; }
 
 clash_proxy() {   # clash_proxy 协议 主机 名称 -> 一行 YAML
   local p=$1 h=$2 n=$3
-  ( . "$STATE/$p.env"
+  ( HOP=""; . "$STATE/$p.env"
   local sni ins scv; read -r sni ins <<<"$(tls_opts "$h")"
   [[ $ins == 1 ]] && scv=true || scv=false
   case $p in
     reality) echo "  - {name: \"$n\", type: vless, server: \"$h\", port: $PORT, uuid: \"$UUID\", network: tcp, udp: true, tls: true, flow: xtls-rprx-vision, servername: \"$SNI\", client-fingerprint: chrome, reality-opts: {public-key: \"$PUB\", short-id: \"$SID\"}}" ;;
-    hy2)     echo "  - {name: \"$n\", type: hysteria2, server: \"$h\", port: $PORT, password: \"$PASS\", sni: \"$sni\", skip-cert-verify: $scv, alpn: [h3]}" ;;
+    hy2)     echo "  - {name: \"$n\", type: hysteria2, server: \"$h\", port: $PORT,${HOP:+ ports: \"$HOP\", hop-interval: 30,} password: \"$PASS\", sni: \"$sni\", skip-cert-verify: $scv, alpn: [h3]}" ;;
     tuic)    echo "  - {name: \"$n\", type: tuic, server: \"$h\", port: $PORT, uuid: \"$UUID\", password: \"$PASS\", sni: \"$sni\", skip-cert-verify: $scv, alpn: [h3], congestion-controller: bbr, udp-relay-mode: native}" ;;
     anytls)  echo "  - {name: \"$n\", type: anytls, server: \"$h\", port: $PORT, password: \"$PASS\", sni: \"$sni\", skip-cert-verify: $scv, client-fingerprint: chrome, udp: true}" ;;
     ss)      echo "  - {name: \"$n\", type: ss, server: \"$h\", port: $PORT, cipher: $METHOD, password: \"$PASS\", udp: true}" ;;
@@ -935,19 +1154,50 @@ EOF
   fi
 }
 
+# 有正式证书（IP / 域名）时订阅走 HTTPS，地址只能用证书里有的 IP / 域名；否则 HTTP
+sub_https() { ca_cert && command -v socat >/dev/null 2>&1; }
+sub_hosts() {
+  if ! sub_https; then link_hosts; return; fi
+  if [[ $CERT_MODE == domain ]]; then echo "$CERT_DOMAIN"; return; fi
+  local h out=""
+  for h in $(link_hosts); do [[ " $CERT_NAMES " == *" $h "* ]] && out+="$h "; done
+  echo "${out:-$CERT_NAMES}"
+}
+sub_service() {   # 按证书情况写订阅服务：HTTPS = socat 做 TLS + busybox httpd -i；HTTP = busybox httpd
+  local httpd; httpd=$(httpd_cmd)
+  ( . "$SUB_ENV"
+    if sub_https; then
+      local pf=""; [[ -f /proc/net/if_inet6 ]] && pf=",pf=ip6,ipv6only=0"
+      svc_write onekey-sub "$(command -v socat) OPENSSL-LISTEN:$PORT,reuseaddr,fork,cert=$CERT_DIR/cert.pem,key=$CERT_DIR/key.pem,verify=0$pf 'EXEC:$httpd -i -h $WWW'"
+    else
+      svc_write onekey-sub "$httpd -f -p $PORT -h $WWW"
+    fi )
+  svc restart onekey-sub; sleep 1
+  [[ $(svc status onekey-sub) == active ]]
+}
+sub_refresh() {   # 证书情况变了（新申请 / 升级脚本）时，按需在 HTTP / HTTPS 之间切换订阅服务
+  sub_on || return 0
+  local was=0 now=0
+  grep -qs OPENSSL-LISTEN /etc/systemd/system/onekey-sub.service /etc/init.d/onekey-sub && was=1
+  sub_https && now=1
+  [[ $was == "$now" ]] && return 0
+  sub_service >/dev/null 2>&1
+  yellow "订阅已改成 $([[ $now == 1 ]] && echo HTTPS || echo HTTP)，新地址：$(sub_url sub)（客户端需重新导入订阅）"
+}
 sub_urls() {
   ( . "$SUB_ENV"
-    local h hb
-    for h in $(link_hosts); do
+    local h hb s=http; sub_https && s=https
+    for h in $(sub_hosts); do
       hb=$h; [[ $h == *:* ]] && hb="[$h]"
-      echo "  小火箭 / v2rayN 订阅：http://$hb:$PORT/$TOKEN/sub"
-      echo "  Clash 订阅：        http://$hb:$PORT/$TOKEN/clash.yaml"
+      echo "  小火箭 / v2rayN 订阅：$s://$hb:$PORT/$TOKEN/sub"
+      echo "  Clash 订阅：        $s://$hb:$PORT/$TOKEN/clash.yaml"
     done )
 }
-sub_url() {   # sub_url sub|clash.yaml -> 按「IP 设置」第一个地址生成的订阅地址
+sub_url() {   # sub_url sub|clash.yaml -> 第一个地址的订阅地址
   ( . "$SUB_ENV"
-    local h; h=$(link_hosts | awk '{print $1}'); [[ $h == *:* ]] && h="[$h]"
-    echo "http://$h:$PORT/$TOKEN/$1" )
+    local s=http; sub_https && s=https
+    local h; h=$(sub_hosts | awk '{print $1}'); [[ $h == *:* ]] && h="[$h]"
+    echo "$s://$h:$PORT/$TOKEN/$1" )
 }
 qr() { [[ $NONINT != 1 ]] && command -v qrencode >/dev/null 2>&1 && qrencode -t ANSIUTF8 "$1"; }
 import_info() {   # 显示 Clash / 小火箭 的订阅导入方式（链接 + 二维码）
@@ -965,10 +1215,12 @@ import_info() {   # 显示 Clash / 小火箭 的订阅导入方式（链接 + �
   echo "订阅地址：$su"
   echo "小火箭首页右上角扫码，或 ＋ → 类型 Subscribe → 粘贴订阅地址："
   qr "sub://$(printf '%s' "$su" | base64 | tr -d '\n')#$(uri "$NAME_PREFIX")"
-  if [[ $LINK_IP == both && -n $IP4 && -n $IP6 ]]; then
+  if [[ $(sub_hosts | wc -w) -gt 1 ]]; then
     echo
-    echo "（另一个 IP 的订阅地址）"; sub_urls | grep -v "$(sub_url sub | cut -d/ -f3)"
+    echo "（另一个 IP 的订阅地址）"; sub_urls | grep -vF "$(sub_url sub | cut -d/ -f3)/"
   fi
+  if sub_https; then green "订阅走 HTTPS（$(cert_label)），传输过程中别人看不到内容"
+  else yellow "订阅现在是明文 HTTP；在主菜单「证书设置」申请 IP / 域名证书后会自动改成 HTTPS"; fi
   yellow "订阅地址等于全部节点的密码，不要公开；泄露后在主菜单 3 更换订阅地址"
 }
 
@@ -988,12 +1240,10 @@ sub_enable() {
     local port; port=$(rand_port)
     printf "PORT='%s'\nTOKEN='%s'\n" "$port" "$(rand_hex 16)" >"$SUB_ENV"; chmod 600 "$SUB_ENV"
     mkdir -p "$WWW"
-    svc_write onekey-sub "$httpd -f -p $port -h $WWW"
     open_port "$port" tcp
   fi
   gen_clients
-  svc restart onekey-sub; sleep 1
-  [[ $(svc status onekey-sub) == active ]] || { red "订阅服务启动失败"; return 1; }
+  sub_service || { red "订阅服务启动失败"; return 1; }
   green "订阅已开启（地址里带随机密钥）"
   import_info
 }
@@ -1005,6 +1255,7 @@ sub_reset() {
 sub_disable() {
   sub_on || { yellow "订阅未开启"; return; }
   svc_remove onekey-sub; rm -rf "$WWW" "$SUB_ENV"; green "订阅已关闭"
+  cert_release
 }
 sub_menu() {
   echo
@@ -1026,10 +1277,12 @@ remove_proto() {
   case $p in
     snell) svc_remove onekey-snell; rm -f "$BASE/snell.conf" "$BIN_SNELL" ;;
     argo)  svc_remove onekey-argo; rm -f "$ARGO_LOG" "$BIN_CF" ;;
+    hy2)   hop_apply; hop_service off ;;   # 端口跳跃规则跟着删
   esac
   [[ $p != snell ]] && apply_core_of "$p"
   gen_clients >/dev/null 2>&1
   green "$(pretty $p) 已删除（订阅和 Clash 配置已同步更新）"
+  cert_release
 }
 
 uninstall_all() {
@@ -1039,6 +1292,8 @@ uninstall_all() {
   svc_remove onekey-xray; svc_remove onekey-sb; svc_remove onekey-snell; svc_remove onekey-argo; svc_remove onekey-sub
   [[ -f /etc/sysctl.d/99-onekey-tcp.conf ]] && tcp_restore
   [[ $CERT_MODE == ip || $CERT_MODE == domain ]] && acme_forget "$(cert_main)"   # acme.sh 本身保留（别的程序可能也在用）
+  cert_cron_set off
+  hop_service off; command -v nft >/dev/null 2>&1 && nft delete table inet onekey_hop >/dev/null 2>&1
   rm -rf "$BASE" "$BIN_XRAY" "$BIN_SB" "$BIN_SNELL" "$BIN_CF" "$CMD" /etc/sysctl.d/99-onekey-bbr.conf
   green "已全部卸载"
 }
@@ -1157,7 +1412,13 @@ status() {
   [[ -x $BIN_SB ]] && echo "sing-box 版本：$($BIN_SB version | head -1 | awk '{print $3}')"
   echo "拥塞控制：$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
   echo "IP 设置：节点地址 $(link_label)，出站 $(out_label)"
-  [[ -n $CERT_MODE ]] && echo "证书：$(cert_label)$( [[ $CERT_MODE != self ]] && echo "，到期 $(cert_expiry)")"
+  if [[ -n $CERT_MODE ]]; then
+    if [[ -s $CERT_DIR/cert.pem ]]; then echo "证书：$(cert_label)$( [[ $CERT_MODE != self ]] && echo "，到期 $(cert_expiry)")"
+    else echo "证书：没有协议在用，已停止续签（再装 Hysteria2 / TUIC / AnyTLS 时自动申请）"; fi
+  fi
+  local hr; hr=$(hop_range); [[ -n $hr ]] && echo "Hysteria2 端口跳跃：UDP $hr"
+  sub_on && echo "订阅：$(sub_https && echo HTTPS || echo HTTP)"
+  cert_warn
   echo
 }
 
@@ -1212,6 +1473,7 @@ main_menu() {
   while :; do
     echo
     blue "=========== OneKey 多协议节点脚本 v$ONEKEY_VER ==========="
+    cert_warn
     echo "  1) 安装 / 添加协议"
     echo "  2) 查看节点链接"
     echo "  3) 订阅链接（小火箭 / Clash）"
@@ -1221,12 +1483,13 @@ main_menu() {
     echo "  7) 运行状态"
     echo "  8) 开启 BBR 加速"
     echo "  9) TCP 调优"
-    echo " 10) 更新内核（已安装的 Xray / sing-box）"
+    echo " 10) 更新（脚本 / 内核）"
     echo " 11) 证书设置（域名 / IP / 自签）"
-    echo " 12) 卸载全部"
+    echo " 12) Hysteria2 端口跳跃"
+    echo " 13) 卸载全部"
     echo "  0) 退出"
     echo
-    local c; read -r -p "请选择 [0-12]: " c
+    local c; read -r -p "请选择 [0-13]: " c
     case $c in
       1) proto_menu ;;
       2) show_links ;;
@@ -1237,9 +1500,10 @@ main_menu() {
       7) status ;;
       8) enable_bbr ;;
       9) tcp_menu ;;
-      10) update_cores ;;
+      10) update_menu ;;
       11) cert_menu ;;
-      12) uninstall_all; exit 0 ;;
+      12) hop_menu ;;
+      13) uninstall_all; exit 0 ;;
       0) exit 0 ;;
     esac
   done
@@ -1252,6 +1516,7 @@ usage() {
       onekey add <协议>      非交互安装（reality|hy2|tuic|anytls|argo|ss|snell）
                              可用环境变量：PORT_SET= SNI= METHOD= MODE= IP_MODE=4|6|both
                              CERT=ip|domain|self DOMAIN=（证书，默认 ip）
+                             HOP_RANGE=on|20000-29999（Hysteria2 端口跳跃）
       onekey links           查看全部链接
       onekey remove <协议>   删除协议
       onekey status          运行状态
@@ -1267,6 +1532,9 @@ usage() {
       onekey cert domain <域名>  换成域名证书
       onekey cert self       换成自签证书
       onekey cert renew      立即续签
+      onekey hop [on|20000-29999|off]  Hysteria2 端口跳跃：开启（默认范围 / 指定范围）/ 关闭
+      onekey update          更新脚本（节点不变）
+      onekey update-core     更新 Xray / sing-box 内核
       onekey uninstall       卸载全部
 EOF
 }
@@ -1291,8 +1559,17 @@ case $1 in
           domain)  set_cert domain "$3" && cert_apply ;;
           renew)   cert_renew ;;
           reload)  cert_reload ;;   # acme.sh 续签后调用
-          *) echo "证书：$(cert_label)$( [[ -s $CERT_DIR/cert.pem ]] && echo "    到期：$(cert_expiry)")" ;;
+          cron)    cert_cron ;;     # 每天的兜底检查
+          *) echo "证书：$(cert_label)$( [[ -s $CERT_DIR/cert.pem ]] && echo "    到期：$(cert_expiry)")"; cert_warn ;;
         esac ;;
+  hop) case $2 in
+         apply) hop_apply ;;   # onekey-hop 服务开机调用
+         on|off|*-*) hop_set "$2" ;;
+         *) r=$(hop_range); echo "Hysteria2 端口跳跃：${r:-未开启}" ;;
+       esac ;;
+  update) self_update "$2" ;;
+  update-core) update_cores ;;
+  migrate) migrate ;;
   uninstall) NONINT=1 uninstall_all ;;
   -v|--version) echo "$ONEKEY_VER" ;;
   *) usage ;;

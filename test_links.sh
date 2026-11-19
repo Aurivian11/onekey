@@ -49,8 +49,11 @@ sb_outbound() {   # 其它链接 -> sing-box outbound
             transport:{type:"ws",path:$path,headers:{Host:$host}}}'
       fi ;;
     hysteria2)
+      # 有 mport（端口跳跃）时只连跳跃范围里的端口，验证跳跃规则真的生效
       jq -nc --arg t "$TAG" --arg h "$HOST" --argjson p "$PORT" --arg pw "$(urldec "$USERINFO")" --arg sni "$(qp sni)" --argjson ins "$(insec)" \
-        '{type:"hysteria2",tag:$t,server:$h,server_port:$p,password:$pw,tls:{enabled:true,server_name:$sni,insecure:$ins,alpn:["h3"]}}' ;;
+        --arg mp "$(qp mport)" \
+        '{type:"hysteria2",tag:$t,server:$h,server_port:$p,password:$pw,tls:{enabled:true,server_name:$sni,insecure:$ins,alpn:["h3"]}}
+         + (if $mp == "" then {} else {server_ports:[$mp|sub("-";":")],hop_interval:"5s"} end)' ;;
     tuic)
       jq -nc --arg t "$TAG" --arg h "$HOST" --argjson p "$PORT" --arg u "${USERINFO%%:*}" --arg pw "$(urldec "${USERINFO#*:}")" \
         --arg sni "$(qp sni)" --arg cc "$(qp congestion_control)" --argjson ins "$(insec)" \
