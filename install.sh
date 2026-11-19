@@ -10,7 +10,7 @@
 # =============================================================
 set -o pipefail
 
-ONEKEY_VER="1.3.1"
+ONEKEY_VER="1.3.2"
 # 一键安装时脚本会从这里下载自己，安装成 onekey 命令
 SCRIPT_URL="${ONEKEY_URL:-https://raw.githubusercontent.com/Aurivian11/onekey/main/install.sh}"
 
@@ -1118,6 +1118,16 @@ pretty() { case $1 in reality) echo VLESS-REALITY;; hy2) echo Hysteria2;; tuic) 
 
 argo_link() { ( . "$STATE/argo.env"; echo "vless://$UUID@$1:443?encryption=none&security=tls&sni=$1&fp=chrome&type=ws&host=$1&path=$(uri "$WSPATH")#$(uri "$NAME_PREFIX-argo")" ); }
 
+ss_params() {   # SS 的明文参数：当中转落地时在 3x-ui 出站 / 其它面板里手动填
+  ( . "$STATE/ss.env"
+    local hs; hs=$(link_hosts | sed 's/ /  或  /')
+    echo "手动填写的参数（3x-ui 出站 / 中转落地用）："
+    echo "  地址：$hs"
+    echo "  端口：$PORT"
+    echo "  加密：$METHOD"
+    echo "  密码：$PASS"
+    echo "  传输：TCP + UDP" )
+}
 show_links() {   # show_links [协议]  不带参数 = 全部
   [[ -z $IP4$IP6 ]] && get_ip
   local p list=("$@") l
@@ -1142,6 +1152,7 @@ show_links() {   # show_links [协议]  不带参数 = 全部
         self) yellow "提示：使用自签证书，客户端需开启「跳过证书验证 / allowInsecure」（主菜单「证书设置」可换成 IP / 域名证书）" ;;
         *)    echo "证书：$(cert_label)，客户端正常验证证书，不用开跳过验证" ;;
       esac ;;
+    ss) ss_params ;;
     esac
   done
   gen_clients
