@@ -11,22 +11,7 @@
 - **TCP 调优**：BBR + fq + 按内存自动调整缓冲区，可一键恢复
 - **干净卸载**：程序、配置、服务、内核参数全部还原
 
-```
-=========== OneKey 多协议节点脚本 v1.1.0 ===========
-  1) 安装 / 添加协议
-  2) 查看节点链接
-  3) 订阅链接（小火箭 / Clash）
-  4) IP 设置（IPv4 / IPv6）
-  5) 删除某个协议
-  6) 重启所有服务
-  7) 运行状态
-  8) 开启 BBR 加速
-  9) TCP 调优
- 10) 更新内核（已安装的 Xray / sing-box）
- 11) 证书设置（域名 / IP / 自签）
- 12) 卸载全部
-  0) 退出
-```
+<p align="center"><img src="docs/menu.png" width="560" alt="OneKey 主菜单"></p>
 
 ## 快速开始
 
@@ -41,6 +26,10 @@ bash <(curl -Ls https://raw.githubusercontent.com/Aurivian11/onekey/main/install
 1. 选 **1 安装 / 添加协议**，选协议，端口直接回车（随机）。
 2. 安装完自动显示每个节点的链接和二维码，小火箭直接扫码导入。
 3. Clash 用户：查看链接时按回车开启订阅，会显示 Clash 订阅地址、`clash://` 一键导入链接和二维码（菜单 3 也能随时查看）。
+
+以安装 Hysteria2 为例：选协议 → 选证书（回车默认 IP 证书）→ 端口回车，自动申请证书并输出链接：
+
+<p align="center"><img src="docs/install.png" width="760" alt="安装 Hysteria2 并申请 IP 证书"></p>
 
 ## 支持的协议
 
@@ -86,6 +75,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/Aurivian11/onekey/main/install
 ## 证书（Hysteria2 / TUIC / AnyTLS）
 
 第一次安装这三个协议之一时选择，以后在菜单 **11** 随时切换。REALITY、Argo、SS、Snell 不需要证书。
+
+<p align="center"><img src="docs/cert.png" width="620" alt="证书设置菜单"></p>
 
 | 证书 | 隐蔽性 | 条件 | 客户端 |
 |---|---|---|---|
@@ -144,6 +135,12 @@ onekey uninstall            # 卸载全部
 ```bash
 bash test_links.sh
 ```
+
+下图是 Debian 13 上 IP 证书模式的实测结果（IPv4 + IPv6 共 8 条链接，Hysteria2 / TUIC / AnyTLS 均开启证书验证）：
+
+<p align="center"><img src="docs/test.png" width="600" alt="运行状态和连通测试"></p>
+
+> 截图里的 IP 用文档保留地址（203.0.113.10 / 2001:db8::10）代替，密码均为示例值。
 
 ## 系统要求
 
