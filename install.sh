@@ -10,7 +10,7 @@
 # =============================================================
 set -o pipefail
 
-ONEKEY_VER="1.2.0"
+ONEKEY_VER="1.3.0"
 # 一键安装时脚本会从这里下载自己，安装成 onekey 命令
 SCRIPT_URL="${ONEKEY_URL:-https://raw.githubusercontent.com/Aurivian11/onekey/main/install.sh}"
 
@@ -294,18 +294,94 @@ SB_PROTOS=(tuic anytls)
 
 gh_latest() { curl -fsSL "https://api.github.com/repos/$1/releases/latest" | jq -r .tag_name; }
 
+# ---------------- Xray 版本 ----------------
+# 新版 Xray（v26.7.11 起）的 REALITY 服务端和 sing-box / mihomo 内核的客户端不兼容，
+# v26.6.27 是实测 Xray / sing-box / mihomo 内核客户端都能连的最后一个版本，所以提供「兼容版」固定在这个版本
+XRAY_COMPAT=v26.6.27
+CORE_ENV=$BASE/core.env
+XRAY_VER=${XRAY_VER:-}          # compat | latest | vX.Y.Z；空 = 还没选（旧版装的按 latest 处理）
+[[ -z $XRAY_VER && -f $CORE_ENV ]] && . "$CORE_ENV"
+save_core_env() { mkdir -p "$BASE"; printf "XRAY_VER='%s'\n" "$XRAY_VER" >"$CORE_ENV"; chmod 600 "$CORE_ENV"; }
+xray_tag() {   # 要装的 Xray 版本号
+  case ${XRAY_VER:-latest} in
+    compat) echo "$XRAY_COMPAT" ;;
+    latest) gh_latest XTLS/Xray-core ;;
+    *)      echo "$XRAY_VER" ;;
+  esac
+}
+xray_ver_label() {
+  case ${XRAY_VER:-latest} in
+    compat) echo "兼容版 $XRAY_COMPAT（固定，REALITY 对 Xray / sing-box / mihomo 客户端都能连）" ;;
+    latest) echo "最新版（更新内核时跟着升级）" ;;
+    *)      echo "固定 $XRAY_VER" ;;
+  esac
+}
+xray_cur() { [[ -x $BIN_XRAY ]] && "$BIN_XRAY" version 2>/dev/null | awk 'NR==1{print "v"$2}'; }   # 不用 head：pipefail 下会因 SIGPIPE 返回失败
+xray_ver_ask() {   # 第一次装 Xray 时选版本（环境变量 XRAY_VER=compat|latest|vX.Y.Z 可跳过询问）
+  [[ -n $XRAY_VER ]] && { save_core_env; return; }
+  if [[ $NONINT == 1 ]]; then XRAY_VER=compat; save_core_env; return; fi
+  echo
+  echo "选择 Xray 内核版本（以后可在主菜单 10「更新」里修改）："
+  echo "  1) 兼容版 $XRAY_COMPAT   VLESS-REALITY 对 Xray / sing-box / mihomo（Clash Meta）内核的客户端都能连（实测）"
+  echo "  2) 最新版              新版 REALITY 只有 Xray 内核客户端（如 v2rayN）能连，sing-box / mihomo 内核连不上"
+  echo "  （只影响 REALITY；Hysteria2 / SS / Argo 两个版本都一样）"
+  case $(ask "请选择" 1) in 2) XRAY_VER=latest ;; *) XRAY_VER=compat ;; esac
+  save_core_env
+}
+
 install_xray() {
   [[ -x $BIN_XRAY && $1 != force ]] && return
-  yellow "下载 Xray 内核..."
+  [[ -x $BIN_XRAY ]] || xray_ver_ask
   local tag tmp asset
-  tag=$(gh_latest XTLS/Xray-core); [[ $tag == v* ]] || die "获取 Xray 版本失败"
+  tag=$(xray_tag); [[ $tag == v* ]] || { red "获取 Xray 版本失败"; return 1; }
+  yellow "下载 Xray 内核 $tag..."
   [[ $ARCH == amd64 ]] && asset=Xray-linux-64.zip || asset=Xray-linux-arm64-v8a.zip
   tmp=$(mktemp -d)
-  curl -fsSL -o "$tmp/x.zip" "https://github.com/XTLS/Xray-core/releases/download/$tag/$asset" || die "下载 Xray 失败"
-  unzip -o -q "$tmp/x.zip" xray -d "$tmp" || die "解压 Xray 失败"
+  if ! curl -fsL -o "$tmp/x.zip" "https://github.com/XTLS/Xray-core/releases/download/$tag/$asset" \
+     || ! unzip -o -q "$tmp/x.zip" xray -d "$tmp" || ! "$tmp/xray" version >/dev/null 2>&1; then
+    rm -rf "$tmp"; red "下载 Xray $tag 失败（版本号不存在或网络问题），原来的内核没动"; return 1
+  fi
   install -m 755 "$tmp/xray" "$BIN_XRAY"; rm -rf "$tmp"
-  green "Xray $($BIN_XRAY version | head -1 | awk '{print $2}') 已安装"
+  green "Xray $(xray_cur) 已安装"
   svc_write onekey-xray "$BIN_XRAY run -c $XRAY_CONF"
+}
+
+set_xray_ver() {   # set_xray_ver compat|latest|vX.Y.Z：切换版本并重装 Xray（已装的话）
+  local v=$1 old=$XRAY_VER
+  case $v in
+    compat|latest) ;;
+    v[0-9]*.*) ;;
+    [0-9]*.*) v=v$v ;;
+    *) red "版本格式不对：$1（例：compat、latest、v26.6.27）"; return 1 ;;
+  esac
+  [[ $v == "$XRAY_COMPAT" ]] && v=compat
+  XRAY_VER=$v
+  if [[ -x $BIN_XRAY ]]; then
+    local want; want=$(xray_tag)
+    if [[ $want == "$(xray_cur)" ]]; then save_core_env; green "Xray 已经是 $want，版本设置改为：$(xray_ver_label)"; return 0; fi
+    if ! install_xray force; then XRAY_VER=$old; return 1; fi
+    [[ -f $XRAY_CONF ]] && { svc restart onekey-xray; sleep 1; }
+    if [[ -f $XRAY_CONF && $(svc status onekey-xray) != active ]]; then
+      red "Xray $want 启动失败（这个版本可能不支持现在的配置），换回原来的版本"
+      XRAY_VER=$old; install_xray force && svc restart onekey-xray; return 1
+    fi
+  fi
+  save_core_env
+  green "Xray 版本：$(xray_ver_label)$( [[ -x $BIN_XRAY ]] && echo "，当前 $(xray_cur)")（节点链接不变）"
+}
+xray_ver_menu() {
+  echo
+  echo "当前 Xray：${XRAY_VER:+$(xray_ver_label)}$( [[ -x $BIN_XRAY ]] && echo "，已安装 $(xray_cur)")"
+  echo "  1) 兼容版 $XRAY_COMPAT   REALITY 对 Xray / sing-box / mihomo（Clash Meta）内核的客户端都能连（推荐）"
+  echo "  2) 最新版              REALITY 只有 Xray 内核客户端（如 v2rayN）能连"
+  echo "  3) 指定版本号"
+  echo "  0) 返回"
+  local c; read -r -p "请选择 [0-3]: " c
+  case $c in
+    1) set_xray_ver compat ;;
+    2) set_xray_ver latest ;;
+    3) local v; read -r -p "版本号（如 v26.6.27，见 github.com/XTLS/Xray-core/releases）：" v; [[ -n $v ]] && set_xray_ver "$v" ;;
+  esac
 }
 
 install_singbox() {
@@ -727,7 +803,14 @@ rebuild() {   # 按「Xray 优先」重新分配内核（旧版全用 sing-box �
 
 update_cores() {
   local any=0
-  [[ -x $BIN_XRAY ]] && { any=1; install_xray force; [[ -f $XRAY_CONF ]] && svc restart onekey-xray; }
+  if [[ -x $BIN_XRAY ]]; then
+    any=1
+    if [[ ${XRAY_VER:-latest} != latest && $(xray_tag) == "$(xray_cur)" ]]; then
+      green "Xray 固定在 $(xray_cur)，不升级；要换版本用「更新」菜单里的「Xray 版本」"
+    else
+      install_xray force && [[ -f $XRAY_CONF ]] && svc restart onekey-xray
+    fi
+  fi
   [[ -x $BIN_SB ]]   && { any=1; install_singbox force; [[ -f $SB_CONF ]] && svc restart onekey-sb; }
   [[ $any == 0 ]] && yellow "还没有安装任何内核（选择协议时才会安装）"
   return 0
@@ -749,19 +832,26 @@ self_update() {   # 下载最新版脚本替换 onekey 命令，然后让新版�
 migrate() {   # 新版脚本第一次运行时调用：按新规则更新服务，不改节点参数
   sub_refresh
   ca_cert && cert_cron_set on
-  if [[ -n $(hop_range) ]]; then hop_apply >/dev/null 2>&1 && hop_service on; fi
+  if [[ -n $(hop_range) ]]; then
+    hop_apply >/dev/null 2>&1 && hop_service on
+    # 1.2.0 检查端口冲突有 bug，可能把别的协议的 UDP 端口划进了跳跃范围
+    hop_ok_range "$(hop_range)" "$( . "$STATE/hy2.env"; echo "$PORT")" >/dev/null 2>&1 \
+      || { red "注意：端口跳跃范围 $(hop_range) 里有别的协议的 UDP 端口，那个协议会连不上"; yellow "运行 onekey hop on 自动换一个不冲突的范围"; }
+  fi
   ls "$STATE"/*.env >/dev/null 2>&1 && gen_clients >/dev/null 2>&1
   return 0
 }
 update_menu() {
   echo
   echo "  1) 更新脚本（onekey 本身，当前 v$ONEKEY_VER）"
-  echo "  2) 更新内核（已安装的 Xray / sing-box 换成最新版，会短暂断线）"
+  echo "  2) 更新内核（sing-box 换成最新版；Xray 按「Xray 版本」设置，会短暂断线）"
+  echo "  3) Xray 版本（当前 $( [[ -x $BIN_XRAY ]] && xray_cur || echo 未安装)$(case ${XRAY_VER:-latest} in compat) echo "，兼容版";; latest) echo "，跟随最新版";; *) echo "，固定版本";; esac)）"
   echo "  0) 返回"
-  local c; read -r -p "请选择 [0-2]: " c
+  local c; read -r -p "请选择 [0-3]: " c
   case $c in
     1) self_update && { yellow "重新打开菜单..."; exec "$CMD"; } ;;
     2) update_cores ;;
+    3) xray_ver_menu ;;
   esac
 }
 
@@ -774,7 +864,7 @@ hop_ok_range() {   # hop_ok_range 范围 Hysteria2端口：检查格式，以及
   [[ $r =~ ^([0-9]+)-([0-9]+)$ ]] || { red "范围格式不对，例：20000-29999"; return 1; }
   a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}
   (( a >= 1024 && b <= 65535 && a < b )) || { red "范围要在 1024-65535 之间，并且前小后大"; return 1; }
-  for p in $(ss -Hlnu 2>/dev/null | awk '{print $5}' | grep -oE '[0-9]+$' | sort -u); do
+  for p in $(ss -Hlnu 2>/dev/null | awk '{print $4}' | grep -oE '[0-9]+$' | sort -u); do   # 只列 UDP 时第 4 列是本地地址
     if (( p >= a && p <= b )) && [[ $p != "$hp" ]]; then red "UDP 端口 $p 已有程序在用，并且在 $r 里，换一个范围"; return 1; fi
   done
 }
@@ -1408,7 +1498,7 @@ status() {
   done
   echo "已安装协议："
   local p; for p in reality hy2 tuic anytls argo ss snell; do has $p && echo "  - $(pretty $p)  端口 $( . "$STATE/$p.env"; echo "$PORT")"; done
-  [[ -x $BIN_XRAY ]] && echo "Xray 版本：$($BIN_XRAY version | head -1 | awk '{print $2}')"
+  [[ -x $BIN_XRAY ]] && echo "Xray 版本：$(xray_cur)$(case ${XRAY_VER:-latest} in compat) echo "（兼容版，固定）";; latest) echo "（跟随最新版）";; *) echo "（固定版本）";; esac)"
   [[ -x $BIN_SB ]] && echo "sing-box 版本：$($BIN_SB version | head -1 | awk '{print $3}')"
   echo "拥塞控制：$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
   echo "IP 设置：节点地址 $(link_label)，出站 $(out_label)"
@@ -1515,6 +1605,7 @@ usage() {
 用法：onekey                 打开菜单
       onekey add <协议>      非交互安装（reality|hy2|tuic|anytls|argo|ss|snell）
                              可用环境变量：PORT_SET= SNI= METHOD= MODE= IP_MODE=4|6|both
+                             XRAY_VER=compat|latest|v26.6.27（第一次装 Xray 的版本，默认 compat）
                              CERT=ip|domain|self DOMAIN=（证书，默认 ip）
                              HOP_RANGE=on|20000-29999（Hysteria2 端口跳跃）
       onekey links           查看全部链接
@@ -1534,7 +1625,8 @@ usage() {
       onekey cert renew      立即续签
       onekey hop [on|20000-29999|off]  Hysteria2 端口跳跃：开启（默认范围 / 指定范围）/ 关闭
       onekey update          更新脚本（节点不变）
-      onekey update-core     更新 Xray / sing-box 内核
+      onekey update-core     更新内核（sing-box 最新版；Xray 按版本设置）
+      onekey xray [compat|latest|v26.6.27]  查看 / 切换 Xray 版本（compat = REALITY 对所有内核客户端都能连的 $XRAY_COMPAT）
       onekey uninstall       卸载全部
 EOF
 }
@@ -1569,6 +1661,8 @@ case $1 in
        esac ;;
   update) self_update "$2" ;;
   update-core) update_cores ;;
+  xray) if [[ -n $2 ]]; then set_xray_ver "$2"
+        else echo "Xray：$( [[ -x $BIN_XRAY ]] && xray_cur || echo 未安装)${XRAY_VER:+，$(xray_ver_label)}"; fi ;;
   migrate) migrate ;;
   uninstall) NONINT=1 uninstall_all ;;
   -v|--version) echo "$ONEKEY_VER" ;;

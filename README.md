@@ -3,7 +3,7 @@
 一行命令在 VPS 上搭好代理节点。数字菜单操作，自动生成分享链接、二维码、Clash 配置和订阅地址，小火箭 / Clash / v2rayN / Surge 都能直接导入。
 
 - **7 种协议**：VLESS-REALITY、Hysteria2、TUIC、AnyTLS、VLESS-Argo、Shadowsocks、Snell v6
-- **双内核按需安装**：Xray 支持的协议用 Xray，不支持的用 sing-box；选了协议才下载内核，不用了自动删除
+- **双内核按需安装**：Xray 支持的协议用 Xray，不支持的用 sing-box；选了协议才下载内核，不用了自动删除；**Xray 版本可选**（兼容版 v26.6.27 / 最新版 / 指定版本）
 - **随机端口**（10000–60000），自动避开已占用端口
 - **IPv4 / IPv6 可选**：节点链接用 IPv4 + IPv6 / 只用 IPv4 / 只用 IPv6；出站可选优先或只用 IPv4 / IPv6
 - **三种证书**：域名证书 / IP 证书（默认，Let's Encrypt，自动续签，和 3x-ui 一样）/ 自签证书；80 端口不行自动改用 443 验证，快过期时菜单里红字提醒
@@ -62,7 +62,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Aurivian11/onekey/main/install
 - 订阅地址等于全部节点的密码，泄露后用「更换订阅地址」让旧地址失效。
 - 请用 mihomo 内核的 Clash（如 Clash Verge Rev），原版 Clash 不支持 REALITY / Hysteria2 / TUIC / AnyTLS。
 
-> **REALITY 兼容性（2026-11 实测）**：Xray 从 v26.7.11 起，REALITY 服务端与 sing-box 内核、mihomo（Clash Meta）内核的客户端不兼容，Xray 内核客户端（如 v2rayN）可正常连接；其它协议不受影响。
+> **REALITY 兼容性（2026-11 实测）**：Xray 从 v26.7.11 起，REALITY 服务端与 sing-box 内核、mihomo（Clash Meta）内核的客户端不兼容，Xray 内核客户端（如 v2rayN）可正常连接；其它协议不受影响。脚本默认装**兼容版 v26.6.27**，Xray / sing-box / mihomo 内核客户端都能连，见下方「Xray 版本」。
 
 ## IP 设置（IPv4 / IPv6）
 
@@ -114,10 +114,33 @@ bash <(curl -Ls https://raw.githubusercontent.com/Aurivian11/onekey/main/install
 
 ```bash
 onekey update        # 更新脚本本身（节点参数和链接不变，会自动按新版规则更新服务）
-onekey update-core   # 把已安装的 Xray / sing-box 换成最新版（会短暂断线）
+onekey update-core   # 更新内核：sing-box 换成最新版，Xray 按下面的「Xray 版本」设置（会短暂断线）
 ```
 
 内核不会自动更新，需要时手动运行。
+
+## Xray 版本
+
+第一次装用到 Xray 的协议（REALITY / Hysteria2 / SS / Argo）时选择，以后在菜单 **10 → 3** 或用 `onekey xray` 修改：
+
+| 选项 | 版本 | REALITY 能连的客户端 |
+|---|---|---|
+| **兼容版（默认）** | 固定 v26.6.27 | Xray 内核（v2rayN 等）、sing-box 内核（sing-box App、NekoBox 等）、mihomo 内核（Clash Verge Rev、Clash Meta for Android 等）都能连 |
+| 最新版 | 跟随 Xray 最新正式版 | 只有 Xray 内核客户端；sing-box / mihomo（Clash Meta）内核连不上 |
+| 指定版本号 | 自己填，如 v26.3.27 | — |
+
+```bash
+onekey xray                 # 查看当前版本和设置
+onekey xray compat          # 换成兼容版 v26.6.27
+onekey xray latest          # 换成最新版
+onekey xray v26.3.27        # 换成指定版本
+```
+
+- 只影响 VLESS-REALITY；Hysteria2 / SS 在两个版本上都实测正常。
+- 2026-11 实测（Debian 13）：兼容版上 REALITY 用 Xray v26.6.27、sing-box 1.14.4、mihomo v1.19.34 三种客户端都通过；最新版 v26.11.9 上 sing-box 和 mihomo 都报 REALITY 验证失败。
+- 兼容版和指定版本「固定」不变，`onekey update-core` 不会把它升级。
+- 换版本时先下载、确认能运行再替换；版本号不存在或新版本起不来会自动换回原来的版本，节点链接不变。
+- 1.2 及以前装的服务器保持原来的最新版，想换就运行 `onekey xray compat`。
 
 ## TCP 调优
 
@@ -140,6 +163,7 @@ IP_MODE=6 onekey add hy2        # 第一次安装时直接指定只用 IPv6（4 
 CERT=self onekey add tuic       # 第一次装 Hysteria2 / TUIC / AnyTLS 时指定证书（ip 默认 | domain | self）
 CERT=domain DOMAIN=example.com onekey add hy2
 HOP_RANGE=on onekey add hy2     # 安装 Hysteria2 时开启端口跳跃（on 用默认范围，也可写 20000-29999）
+XRAY_VER=latest onekey add reality  # 第一次装 Xray 时指定版本（compat 默认 | latest | v26.x.y）
 onekey links                # 查看全部链接
 onekey sub                  # 开启订阅 / 查看订阅地址（sub reset 换地址，sub off 关闭）
 onekey clash                # 输出 Clash 配置
@@ -156,13 +180,14 @@ onekey cert ip              # 换成 IP 证书（domain <域名> 换域名证书
 onekey cert renew           # 立即续签
 onekey hop on               # Hysteria2 端口跳跃：on 默认范围 / 20000-29999 指定范围 / off 关闭
 onekey update               # 更新脚本
-onekey update-core          # 更新内核
+onekey update-core          # 更新内核（Xray 按版本设置）
+onekey xray compat          # Xray 换成兼容版 v26.6.27（latest 最新版，或写具体版本号）
 onekey uninstall            # 卸载全部
 ```
 
 ## 测试工具
 
-`test_links.sh` 会读取脚本生成的分享链接，在服务器上逐个连接并访问 `generate_204`，检查每条链接是否可用（REALITY 用 Xray 客户端测，其它用 sing-box 客户端测；链接没写跳过证书验证时会真正校验证书）：
+`test_links.sh` 会读取脚本生成的分享链接，在服务器上逐个连接并访问 `generate_204`，检查每条链接是否可用（REALITY 用 Xray 和 sing-box 两种客户端都测，其它用 sing-box 客户端测；链接没写跳过证书验证时会真正校验证书）：
 
 ```bash
 bash test_links.sh

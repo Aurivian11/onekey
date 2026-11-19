@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 用 onekey 生成的分享链接构造客户端，逐个测试连通性（在服务器上运行）
-#  - VLESS-REALITY：服务端是 Xray，用 Xray 客户端测（新版 Xray 的 REALITY 与 sing-box 客户端不兼容）
+#  - VLESS-REALITY：Xray 客户端和 sing-box 客户端都测（新版 Xray 的 REALITY 与 sing-box 客户端不兼容，
+#    兼容版 v26.6.27 两个都能过）
 #  - 其它协议：用 sing-box 客户端测（链接没写跳过证书验证时会真正校验证书）
 # 用法：bash test_links.sh [链接文件，默认 /etc/onekey/links.txt]
 set -o pipefail
@@ -72,11 +73,22 @@ SB_OUT=(); SB_IN=(); SB_RULE=(); X_OUT=(); X_IN=(); X_RULE=(); NAMES=(); i=0
 while IFS= read -r l; do
   [[ $l == *://* ]] || continue
   parse "$l"; port=$((11000 + i)); name=$TAG
-  if [[ $SCHEME == vless && $(qp security) == reality && $HAS_XRAY == 1 ]]; then
-    X_OUT+=("$(xray_outbound)")
-    X_IN+=("$(jq -nc --arg t "in$i" --argjson p $port '{tag:$t,listen:"127.0.0.1",port:$p,protocol:"socks",settings:{udp:true}}')")
-    X_RULE+=("$(jq -nc --arg i "in$i" --arg o "$name" '{type:"field",inboundTag:[$i],outboundTag:$o}')")
-    NAMES+=("$name:$port:xray")
+  if [[ $SCHEME == vless && $(qp security) == reality ]]; then
+    # REALITY 用 Xray 和 sing-box 两种客户端都测（检查 Xray 版本对不同内核客户端的兼容性）
+    if [[ $HAS_XRAY == 1 ]]; then
+      X_OUT+=("$(xray_outbound)")
+      X_IN+=("$(jq -nc --arg t "in$i" --argjson p $port '{tag:$t,listen:"127.0.0.1",port:$p,protocol:"socks",settings:{udp:true}}')")
+      X_RULE+=("$(jq -nc --arg i "in$i" --arg o "$name" '{type:"field",inboundTag:[$i],outboundTag:$o}')")
+      NAMES+=("$name:$port:xray")
+    fi
+    if [[ $HAS_SB == 1 ]]; then
+      p2=$((12000 + i)); TAG="$name(sb)"; o=$(sb_outbound)
+      SB_OUT+=("$o")
+      SB_IN+=("$(jq -nc --arg t "sb$i" --argjson p $p2 '{type:"mixed",tag:$t,listen:"127.0.0.1",listen_port:$p}')")
+      SB_RULE+=("$(jq -nc --arg i "sb$i" --arg o "$TAG" '{inbound:[$i],outbound:$o}')")
+      NAMES+=("$TAG:$p2:sing-box")
+    fi
+    [[ $HAS_XRAY == 0 && $HAS_SB == 0 ]] && NAMES+=("$name:0:none")
   elif [[ $HAS_SB == 1 ]]; then
     o=$(sb_outbound); [[ -n $o ]] || continue
     SB_OUT+=("$o")
