@@ -10,7 +10,7 @@
 # =============================================================
 set -o pipefail
 
-ONEKEY_VER="1.3.0"
+ONEKEY_VER="1.3.1"
 # 一键安装时脚本会从这里下载自己，安装成 onekey 命令
 SCRIPT_URL="${ONEKEY_URL:-https://raw.githubusercontent.com/Aurivian11/onekey/main/install.sh}"
 
@@ -976,8 +976,8 @@ hop_menu() {
 confirm_overwrite() {
   has "$1" || return 0
   [[ $NONINT == 1 ]] && return 0
-  local a; read -r -p "$2 已存在，覆盖重装？[y/N]: " a
-  [[ $a == [yY] ]]
+  local a; read -r -p "$2 已存在，覆盖重装？（旧链接和密码会作废）[Y/n]: " a
+  [[ $a != [nN] ]]
 }
 
 add_reality() {
@@ -993,8 +993,8 @@ add_hy2() {
   need_core hy2; gen_cert; ask_port "Hysteria2 (UDP)" hy2
   local hop=${HOP_RANGE:-}   # 非交互：HOP_RANGE=on 或 20000-29999 开启端口跳跃
   if [[ -z $hop && $NONINT != 1 ]]; then
-    local a; read -r -p "开启端口跳跃？（一段 UDP 端口都转给 Hysteria2，不容易被针对单个端口限速）[y/N]: " a
-    [[ $a == [yY] ]] && hop=$(ask "端口范围" "$(hop_default "$PORT")")
+    local a; read -r -p "开启端口跳跃？（一段 UDP 端口都转给 Hysteria2，不容易被针对单个端口限速）[Y/n]: " a
+    [[ $a != [nN] ]] && hop=$(ask "端口范围" "$(hop_default "$PORT")")
   fi
   save_state hy2 PORT="$PORT" PASS="$(rand_pw 24)"
   open_port "$PORT" udp
@@ -1377,7 +1377,7 @@ remove_proto() {
 
 uninstall_all() {
   if [[ $NONINT != 1 ]]; then
-    local a; read -r -p "确定卸载全部协议和程序？[y/N]: " a; [[ $a == [yY] ]] || return
+    local a; read -r -p "确定卸载全部协议和程序？[Y/n]: " a; [[ $a == [nN] ]] && return
   fi
   svc_remove onekey-xray; svc_remove onekey-sb; svc_remove onekey-snell; svc_remove onekey-argo; svc_remove onekey-sub
   [[ -f /etc/sysctl.d/99-onekey-tcp.conf ]] && tcp_restore
